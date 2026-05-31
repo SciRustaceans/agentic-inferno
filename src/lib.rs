@@ -1,9 +1,9 @@
-pub mod error;
+pub mod app;
 pub mod config;
+pub mod error;
+pub mod guards;
+pub mod orchestrator;
+pub mod prompts;
 pub mod providers;
 pub mod state;
 pub mod tui;
-pub mod orchestrator;
-pub mod prompts;
-pub mod guards;
-pub mod app;

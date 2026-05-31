@@ -1,6 +1,6 @@
 use std::process::{ExitCode, Termination};
 
-use agentic_inferno::config::{CliArgs, Config, TomlConfig};
+use agentic_inferno::config::{CliArgs, Config, InfernoTask, TomlConfig};
 use agentic_inferno::error::AppError;
 use agentic_inferno::orchestrator;
 use agentic_inferno::state::SharedState;
@@ -41,11 +41,17 @@ fn main() -> CliExitCode {
         }
     };
 
-    let initial_content = match std::fs::read_to_string(&config.input) {
-        Ok(content) => content,
-        Err(e) => {
-            eprintln!("Error: failed to read input file: {e}");
-            return CliExitCode(ExitCode::from(AppError::Io(e)));
+    // Choose the seed source: prompt mode has no input file and starts empty;
+    // every other task reads the validated --input file.
+    let initial_content = if config.task == InfernoTask::Prompt {
+        String::new()
+    } else {
+        match std::fs::read_to_string(&config.input) {
+            Ok(content) => content,
+            Err(e) => {
+                eprintln!("Error: failed to read input file: {e}");
+                return CliExitCode(ExitCode::from(AppError::Io(e)));
+            }
         }
     };
 
@@ -68,13 +74,12 @@ fn main() -> CliExitCode {
     }
 }
 
-async fn run_spectacle_app(
-    config: Config,
-    initial_content: String,
-) -> Result<(), AppError> {
+async fn run_spectacle_app(config: Config, initial_content: String) -> Result<(), AppError> {
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
     let cancel_token = CancellationToken::new();
     let state = SharedState::new(initial_content);
+
+    let task_label = config.task.to_string();
 
     let spectacle_handle = tokio::spawn(orchestrator::run_spectacle(
         config.clone(),
@@ -85,7 +90,7 @@ async fn run_spectacle_app(
 
     install_panic_hook();
     let (mut tui, _guard) = Tui::enter(cancel_token.clone())?;
-    tui.run(event_rx).await?;
+    tui.run(event_rx, task_label).await?;
     Tui::exit()?;
 
     spectacle_handle

@@ -2,7 +2,7 @@
 name = "agentic-inferno"
 version = "0.1.0"
 edition = "2021"
-description = "A terminal spectacle where Writer and Critic LLM agents duel in an endless loop of revision and beratement"
+description = "A terminal app where a Writer LLM revises a document in a loop while a Critic LLM heckles it"
 homepage = "https://github.com/SciRustaceans/agentic-inferno"
 repository = "https://github.com/SciRustaceans/agentic-inferno"
 

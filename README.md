@@ -1,8 +1,14 @@
 # agentic-inferno
 
-A terminal spectacle where a Writer LLM agent and a Critic LLM agent run concurrently in an endless loop of revision and beratement.
+A terminal app that runs two LLM agents at once: a Writer that keeps revising a
+document, and a Critic that heckles every revision. The Writer never tries to
+finish. It just keeps reworking the document while the Critic responds to each
+version. When the criticism gets harsh, the Writer stops and apologizes to you.
 
-You sit back and watch. The Writer frantically revises your document while the Critic shreds every change with theatrical contempt. When the insults get too harsh the Writer stops mid-thought, turns to you, the audience, and apologizes for its existence. No convergence. No "done." Just two agents locked in a cage match until you hit Esc or the money runs out.
+You watch. The Writer and Critic each make their own API calls and you see both
+outputs in split panes. There's no convergence and no "done" state. The loop
+runs until you hit Esc or the cost ceiling is reached. Your original document is
+never touched.
 
 ## Quick start
 
@@ -17,15 +23,72 @@ Or clone and build locally:
 git clone https://github.com/jojomatik/agentic-inferno
 cd agentic-inferno
 cargo build --release
-./target/release/agentic-inferno --writer-model gpt-4o --input my-draft.md
+#./target/release/agentic-inferno --writer-model gpt-4o --input my-draft.md
 ```
+
+## Install scripts
+
+The install scripts install Rust if it's missing, build the release binary, and
+then prompt you for each API key and write the ones you enter into `.env`. Input
+is hidden as you type, and blank input skips that provider. Re-running is safe —
+it won't overwrite a real key without asking.
+
+**macOS / Linux:**
+
+```bash
+chmod +x install.sh
+./install.sh
+```
+
+**Windows:** see the [Windows](#windows) section.
+
+The `.env` file and `--input` paths work the same on every platform.
+
+## Windows
+
+On Windows, run the install script from a PowerShell prompt in the cloned repo:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+`install.ps1` installs Rust (via `winget`, falling back to `rustup-init.exe`),
+checks for a C linker, builds the release binary, and prompts for your API keys
+into `.env`.
+
+Prerequisites on Windows:
+
+- **A C linker.** The default Rust toolchain links with MSVC, so you need the
+  **"Desktop development with C++"** workload from the
+  [Build Tools for Visual Studio 2022](https://visualstudio.microsoft.com/visual-cpp-build-tools/).
+  `install.ps1` tries to install this for you. If you'd rather not install
+  Visual Studio, use the GNU toolchain instead:
+
+  ```powershell
+  rustup toolchain install stable-x86_64-pc-windows-gnu
+  rustup default stable-x86_64-pc-windows-gnu
+  ```
+
+- **claude CLI** — only if you plan to use Anthropic models. The app looks for
+  `claude.cmd`, `claude.exe`, or `claude` on your PATH.
+
+Once Windows release artifacts are published, a one-line PowerShell installer
+will fetch a prebuilt binary (no Rust needed):
+
+```powershell
+# Available once Windows release artifacts ship.
+powershell -c "irm https://github.com/jojomatik/agentic-inferno/releases/latest/download/agentic-inferno-installer.ps1 | iex"
+```
+
+That installer only fetches the binary — use `install.ps1` (or copy
+`.env.example` to `.env`) to set up your API keys.
 
 ## Prerequisites
 
 - **Rust** (1.80+) for building from source
 - **API keys** set in a `.env` file or exported as environment variables (see [`.env` setup](#env-setup))
 - **claude CLI** (optional, only if you plan to use Anthropic models) — [install from Anthropic](https://docs.anthropic.com/en/docs/claude-code/overview)
-- **Terminal** at least 80×24. Smaller terminals get a polite red warning.
+- **Terminal** at least 80×24. Smaller terminals get a red warning instead of the layout.
 
 ## Usage
 
@@ -39,18 +102,45 @@ agentic-inferno \
   --temperature 0.9
 ```
 
-The Writer and Critic fire off independent API calls. You see both outputs streaming live in split panes. The status bar tracks cost in real time across both agents and any generated apologies.
+The Writer and Critic make independent API calls. Both outputs stream live in
+split panes. The status bar tracks cost in real time across both agents and any
+apologies.
 
-Hit **Esc** or **q** to stop. The tool cancels in-flight requests and exits. No save dialog. No confirmation. The document you started with stays exactly where it was.
+Hit **Esc** or **q** to stop. The tool cancels in-flight requests and exits.
+There's no save dialog and no confirmation. The document you started with is left
+exactly as it was.
+
+### Tasks and prompt mode
+
+By default the Writer revises a piece of prose. Use `--task` to point it at a
+different kind of work:
+
+```bash
+agentic-inferno --writer-model gpt-4o --task code --input src/lib.rs
+```
+
+`prompt` mode is different. Instead of an input file, you give the Writer a
+free-form goal with `--prompt`. It treats the goal as something it can never
+fully reach and keeps attempting it while the Critic piles on. No `--input` is
+needed:
+
+```bash
+agentic-inferno --writer-model gpt-4o --prompt "prove that 1 equals 2"
+```
+
+Passing `--prompt` selects `--task prompt` automatically unless you set `--task`
+yourself.
 
 ## CLI flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--writer-model` | *(required)* | Model for the Writer agent (e.g. `gpt-4o`, `deepseek-reasoner`, `claude-sonnet-4-20250514`) |
-| `--critic-model` | `deepseek-chat` | Model for the Critic agent. Cheap models recommended — the Critic produces entertainment, not value. |
-| `--input` | *(required)* | Path to the document the Writer will revise. Must be outside the repo or inside `inputs/`. |
-| `--max-cost-usd` | `2.0` | Ceiling in USD. When total spend hits this number the spectacle stops. |
+| `--critic-model` | `deepseek-chat` | Model for the Critic agent. A cheap model is fine here — the Critic only produces commentary. |
+| `--task` | `writing` | What the Writer works on. One of: `writing`, `code`, `research`, `analysis`, `prompt`. |
+| `--input` | *(required unless `--task prompt`)* | Path to the document the Writer will revise. Must be outside the repo or inside `inputs/`. Ignored in prompt mode. |
+| `--prompt` | *(none)* | A free-form goal for the Writer to keep attempting. Required for `--task prompt`; supplying it implies `--task prompt`. |
+| `--max-cost-usd` | `2.0` | Cost ceiling in USD. When total spend reaches this, the loop stops. |
 | `--temperature` | `0.8` | Sampling temperature for both agents (0.0–2.0). |
 | `--max-tokens` | `8192` | Maximum tokens per model response. |
 | `--timeout-secs` | `120` | Request timeout in seconds. |
@@ -60,14 +150,14 @@ Hit **Esc** or **q** to stop. The tool cancels in-flight requests and exits. No 
 | `--deepseek-base-url` | *(provider default)* | Override DeepSeek API base URL. |
 | `--moonshot-base-url` | *(provider default)* | Override Moonshot API base URL. |
 
-Critic styles let you choose your preferred flavor of abuse:
+The critic styles control the tone of the heckling:
 
-- **aggressive** — Vicious, loud, merciless. Creative insults only.
-- **passive-aggressive** — Venom wrapped in silk. "I'm sure you tried your best."
-- **theatrical** — Shakespearean soliloquies of despair. "Alas, poor writing, I knew it well!"
-- **academic-snob** — Cites imaginary papers with insufferable confidence. "As Smith et al. (2024) demonstrate in their seminal work..."
-- **disappointed** — Not angry. Just profoundly disappointed. Parent-level guilt.
-- **random** — Picks one of the above on every cycle. Keeps everyone on edge.
+- **aggressive** — Loud and harsh. Insults, no advice.
+- **passive-aggressive** — Backhanded compliments and dry sarcasm. "I'm sure you tried your best."
+- **theatrical** — Dramatic, Shakespearean despair. "Alas, poor writing, I knew it well!"
+- **academic-snob** — Cites made-up papers with total confidence. "As Smith et al. (2024) demonstrate..."
+- **disappointed** — Not angry, just disappointed. Parent-style guilt.
+- **random** — Picks one of the above each cycle.
 
 ## `.env` setup
 
@@ -92,11 +182,13 @@ Copy `.env.example` to `.env` and fill in the keys you need:
 cp .env.example .env
 ```
 
-Only the keys for the providers you actually use are required. The tool validates at startup and tells you exactly which ones are missing.
+You only need the keys for the providers you actually use. The tool validates at
+startup and tells you which ones are missing.
 
 ## TOML config
 
-You can provide a TOML config file instead of (or in addition to) CLI flags. CLI flags take precedence over TOML values, which take precedence over defaults:
+You can use a TOML config file instead of (or alongside) CLI flags. CLI flags
+take precedence over TOML values, which take precedence over defaults:
 
 ```toml
 # inferno.toml
@@ -115,13 +207,13 @@ openai_base_url = "https://custom.openai.com/v1"
 agentic-inferno --config inferno.toml
 ```
 
-Partial config files are fine — unspecified values fall through to defaults.
+Partial config files are fine. Anything you leave out falls through to defaults.
 
 ## TUI keys
 
 | Key | Action |
 |-----|--------|
-| `Esc` / `q` | Stop the spectacle. Cancels in-flight requests and exits. |
+| `Esc` / `q` | Stop. Cancels in-flight requests and exits. |
 | `Ctrl+C` | Hard quit — immediate exit, no draining. |
 | `Tab` | Cycle focus between Writer (left) and Critic (right) panes. |
 | `Up` / `Down` | Scroll focused pane by 1 line. |
@@ -129,7 +221,7 @@ Partial config files are fine — unspecified values fall through to defaults.
 | `Home` | Jump to the top of the focused pane. |
 | `End` | Jump to the bottom (latest content) of the focused pane. |
 
-The focused pane gets a yellow border. The unfocused Critic pane keeps a red border for atmosphere.
+The focused pane gets a yellow border. The unfocused Critic pane keeps a red one.
 
 ## Architecture
 
@@ -154,17 +246,32 @@ Three concurrent loops share a single document in memory:
 └──────────────────────────────────────────────────────┘
 ```
 
-Both loops run independently. The Writer doesn't wait for the Critic and the Critic doesn't wait for the Writer. Each grabs the latest snapshot of the shared document and does its thing.
+The two loops run independently. The Writer doesn't wait for the Critic and the
+Critic doesn't wait for the Writer. Each one grabs the latest snapshot of the
+shared document and works from that.
 
-The **Writer** incorporates critique history into its prompt (with context-window pruning at 90%), revises the document, and emits the result. If the Critic has been particularly harsh — three or more distinct harsh keywords in a single response — an apology workflow triggers regardless of whether the Writer asked for one.
+The **Writer** folds the critique history into its prompt (pruned at 90% of the
+context window), revises the document, and emits the result. If the Critic was
+especially harsh — three or more distinct harsh keywords in one response — an
+apology fires whether or not the Writer asked for one.
 
-When the Writer explicitly appends `[APOLOGY]` to its output, a separate LLM call fires with the apology prompt. The Writer and Critic loops continue immediately — the apology runs in its own spawned task. A 30-second / 3-cycle cooldown prevents apology spam.
+When the Writer appends `[APOLOGY]` to its output, a separate LLM call runs with
+the apology prompt. The Writer and Critic loops keep going while the apology runs
+in its own spawned task. A 30-second / 3-cycle cooldown keeps apologies from
+spamming.
 
-The **Critic** never scores, never suggests rewrites, and never outputs document prose. It's pure entertainment. The prompt for each personality style explicitly forbids constructive feedback.
+The **Critic** never scores the work, never suggests rewrites, and never outputs
+document prose. The prompt for each personality forbids constructive feedback.
 
-The **shared document** lives in a `RwLock<SharedState>`. Version counters on every update let the Writer detect stale critiques without blocking. Semantic loop detection with a sliding window of 5 hashes (threshold: 3 repeats) halts the spectacle when output stagnates.
+The **shared document** lives in a `RwLock<SharedState>`. A version counter on
+every update lets the Writer notice stale critiques without blocking. Loop
+detection over a sliding window of 5 hashes (threshold: 3 repeats) stops the run
+when output stops changing.
 
-The **cost ceiling** is shared across all three loops. Each successful LLM call records its cost (estimated from token counts for OpenAI-compatible APIs, or via the `claude` CLI's built-in cost reporting). When the ceiling is hit, the cancellation token fires and all loops drain.
+The **cost ceiling** is shared across all three loops. Each successful LLM call
+records its cost (estimated from token counts for OpenAI-compatible APIs, or read
+from the `claude` CLI's own cost reporting). When the ceiling is reached, the
+cancellation token fires and the loops drain.
 
 ## Provider support
 
@@ -175,22 +282,33 @@ The **cost ceiling** is shared across all three loops. Each successful LLM call 
 | **DeepSeek** | REST API (OpenAI-compatible) | `deepseek-*` |
 | **Moonshot** | REST API (OpenAI-compatible) | `kimi-*`, `moonshot-*` |
 
-Model names are case-insensitive. Provider detection is order-sensitive — Anthropic patterns are checked first so `opus` routes correctly.
+Model names are case-insensitive. Provider detection is order-sensitive —
+Anthropic patterns are checked first so `opus` routes correctly.
 
-Anthropic models require the `claude` CLI on your PATH. The tool calls `claude --version` at startup and fails with a clear error if it's not found.
+Anthropic models need the `claude` CLI on your PATH. The tool runs
+`claude --version` at startup and fails with a clear error if it isn't found.
 
-OpenAI, DeepSeek, and Moonshot all use the same OpenAI-compatible REST client under the hood. You can point them at any compatible proxy by setting the appropriate base URL.
+OpenAI, DeepSeek, and Moonshot share the same OpenAI-compatible REST client. You
+can point any of them at a compatible proxy by setting the matching base URL.
 
-## Cost warning
+## Cost
 
-This tool makes API calls. API calls cost money. Typical usage runs between $0.50 and $2.00 per hour depending on your model choices.
+This tool makes API calls, and API calls cost money. Typical usage runs between
+$0.50 and $2.00 per hour depending on the models you pick.
 
-Set `--max-cost-usd` to a number you're comfortable with. The default is $2.00. The status bar shows cumulative spend so you can see the meter running.
+Set `--max-cost-usd` to a number you're comfortable with. The default is $2.00.
+The status bar shows cumulative spend so you can watch the meter.
 
-A cheap Critic model (`deepseek-chat` is the default) keeps costs down. The Writer model is where you'll burn most of your budget. If you use Anthropic models, the `claude` CLI reports costs natively. For OpenAI-compatible APIs, costs are estimated from prompt and completion token counts using each provider's published pricing.
+A cheap Critic model (the default is `deepseek-chat`) keeps costs down. The
+Writer model is where most of the budget goes. Anthropic models report their cost
+through the `claude` CLI. For OpenAI-compatible APIs, cost is estimated from
+prompt and completion token counts using each provider's published pricing.
 
-The cost ceiling is a hard limit. When total spend hits it the spectacle stops immediately — no final revision, no graceful wrap-up. Set it low the first time you run.
+The cost ceiling is a hard limit. When total spend reaches it, the loop stops
+immediately — no final revision, no wrap-up. Set it low the first time you run.
 
 ## License
 
 MIT — see [LICENSE](LICENSE).
+</content>
+</invoke>

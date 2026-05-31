@@ -57,10 +57,7 @@ impl Drop for EnvGuard {
 ///
 /// The input file is created in a temp directory outside the repository so
 /// the leak guard passes.  `deepseek_base_url` points to the wiremock URI.
-fn build_test_config(
-    input_content: &str,
-    mock_uri: &str,
-) -> (tempfile::TempDir, Config) {
+fn build_test_config(input_content: &str, mock_uri: &str) -> (tempfile::TempDir, Config) {
     let tmp = tempfile::TempDir::new().expect("failed to create temp dir");
     let input_path = tmp.path().join("test_input.txt");
     std::fs::write(&input_path, input_content).expect("failed to write test input");
@@ -68,7 +65,9 @@ fn build_test_config(
     let cli = CliArgs {
         writer_model: "deepseek-reasoner".into(),
         critic_model: Some("deepseek-chat".into()),
-        input: input_path,
+        input: Some(input_path),
+        task: None,
+        prompt: None,
         max_cost_usd: Some(100.0),
         temperature: Some(0.8),
         max_tokens: Some(256),
@@ -86,11 +85,7 @@ fn build_test_config(
 
 /// Mount a mock on the given [`MockServer`] that returns a fixed success
 /// response.  Matches requests whose JSON body contains `body_substr`.
-async fn mount_success_mock(
-    server: &MockServer,
-    body_substr: &str,
-    response_text: String,
-) {
+async fn mount_success_mock(server: &MockServer, body_substr: &str, response_text: String) {
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .and(body_string_contains(body_substr))
@@ -104,11 +99,7 @@ async fn mount_success_mock(
 
 /// Mount a mock that returns a fixed HTTP error status (no retries on 4xx).
 #[allow(dead_code)]
-async fn mount_error_mock(
-    server: &MockServer,
-    body_substr: &str,
-    status: u16,
-) {
+async fn mount_error_mock(server: &MockServer, body_substr: &str, status: u16) {
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .and(body_string_contains(body_substr))
@@ -168,10 +159,7 @@ async fn mount_delayed_mock(
 
 /// Drain all buffered events from the receiver within `timeout`.
 /// Returns the collected events.
-async fn drain_events(
-    rx: &mut UnboundedReceiver<AppEvent>,
-    timeout: Duration,
-) -> Vec<AppEvent> {
+async fn drain_events(rx: &mut UnboundedReceiver<AppEvent>, timeout: Duration) -> Vec<AppEvent> {
     let mut events = Vec::new();
     let deadline = Instant::now() + timeout;
     loop {
@@ -191,10 +179,7 @@ async fn drain_events(
 /// Count how many events of a specific variant were received.
 macro_rules! count_events {
     ($events:expr, $pat:pat) => {
-        $events
-            .iter()
-            .filter(|e| matches!(e, $pat))
-            .count()
+        $events.iter().filter(|e| matches!(e, $pat)).count()
     };
 }
 
@@ -211,18 +196,8 @@ async fn test_writer_and_critic_produce_output_within_10s() {
     let server = MockServer::start().await;
     let (_tmp, config) = build_test_config("Initial document.", &server.uri());
 
-    mount_success_mock(
-        &server,
-        "\"deepseek-reasoner\"",
-        "Writer revision".into(),
-    )
-    .await;
-    mount_success_mock(
-        &server,
-        "\"deepseek-chat\"",
-        "Critic remark".into(),
-    )
-    .await;
+    mount_success_mock(&server, "\"deepseek-reasoner\"", "Writer revision".into()).await;
+    mount_success_mock(&server, "\"deepseek-chat\"", "Critic remark".into()).await;
 
     let state = SharedState::new("Initial document.".into());
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
@@ -258,9 +233,7 @@ async fn test_writer_and_critic_produce_output_within_10s() {
         "expected at least 1 CriticOutput, got {critic_outputs}"
     );
 
-    eprintln!(
-        "Spectacle ran: {writer_outputs} writer outputs, {critic_outputs} critic outputs"
-    );
+    eprintln!("Spectacle ran: {writer_outputs} writer outputs, {critic_outputs} critic outputs");
 }
 
 // =========================================================================
@@ -276,10 +249,8 @@ async fn test_version_stamping_writer_increments_critic_snapshots() {
     let server = MockServer::start().await;
     let (_tmp, config) = build_test_config("v0", &server.uri());
 
-    let writer_ctr = mount_counting_mock(&server, "\"deepseek-reasoner\"", "W")
-        .await;
-    let _critic_ctr =
-        mount_counting_mock(&server, "\"deepseek-chat\"", "C").await;
+    let writer_ctr = mount_counting_mock(&server, "\"deepseek-reasoner\"", "W").await;
+    let _critic_ctr = mount_counting_mock(&server, "\"deepseek-chat\"", "C").await;
 
     let state = SharedState::new("v0".into());
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
@@ -435,11 +406,12 @@ async fn test_stale_critique_warning_no_crash() {
 
     // No errors should have been emitted.
     let errors = count_events!(events, AppEvent::Error(_));
-    assert_eq!(errors, 0, "expected no errors during stale-critique scenario");
-
-    eprintln!(
-        "Stale critique test: {writer_outputs} writer outputs — no crash or error events"
+    assert_eq!(
+        errors, 0,
+        "expected no errors during stale-critique scenario"
     );
+
+    eprintln!("Stale critique test: {writer_outputs} writer outputs — no crash or error events");
 }
 
 // =========================================================================
@@ -782,14 +754,8 @@ async fn test_shared_state_snapshot_and_update_interactions() {
             "critique version {ver} should be <= final document version {}",
             final_snapshot.0
         );
-        assert!(
-            !text.is_empty(),
-            "critique text should not be empty"
-        );
-        eprintln!(
-            "Critique stored: version={ver}, text_len={}",
-            text.len()
-        );
+        assert!(!text.is_empty(), "critique text should not be empty");
+        eprintln!("Critique stored: version={ver}, text_len={}", text.len());
     }
 }
 
@@ -860,8 +826,14 @@ async fn test_cancel_during_llm_call_no_corruption() {
     // `run_spectacle` does a `state.update(initial_content)` at startup
     // (→ v1), but no LLM revision should have completed.
     let snapshot = state.snapshot();
-    assert_eq!(snapshot.0, 1, "only the initial update (v1) should have completed, no LLM revision");
-    assert_eq!(snapshot.1, "Initial.", "content should be unchanged from initial");
+    assert_eq!(
+        snapshot.0, 1,
+        "only the initial update (v1) should have completed, no LLM revision"
+    );
+    assert_eq!(
+        snapshot.1, "Initial.",
+        "content should be unchanged from initial"
+    );
     assert!(
         state.read_critique().is_none(),
         "no critique should have been stored"

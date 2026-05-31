@@ -20,7 +20,10 @@ impl CostCeiling {
     ///
     /// Panics if `limit <= 0.0`.
     pub fn new(limit: f64) -> Self {
-        assert!(limit > 0.0, "CostCeiling limit must be positive, got {limit}");
+        assert!(
+            limit > 0.0,
+            "CostCeiling limit must be positive, got {limit}"
+        );
         Self {
             spent: Mutex::new(0.0),
             limit,

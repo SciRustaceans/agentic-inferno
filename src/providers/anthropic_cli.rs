@@ -24,6 +24,15 @@ use tokio::time::{timeout, Duration};
 use crate::error::AppError;
 use crate::providers::{ChatReply, ChatRequest, LlmClient};
 
+/// Token usage block from the `claude` CLI JSON, when present.
+#[derive(Debug, Deserialize)]
+pub struct ClaudeUsage {
+    #[serde(default)]
+    pub(crate) input_tokens: u64,
+    #[serde(default)]
+    pub(crate) output_tokens: u64,
+}
+
 /// The JSON object emitted by `claude --output-format json`.
 #[derive(Debug, Deserialize)]
 pub struct ClaudeCliResponse {
@@ -39,6 +48,8 @@ pub struct ClaudeCliResponse {
     pub(crate) result: Option<String>,
     /// Estimated cost in USD (optional; may be absent on error responses).
     pub(crate) total_cost_usd: Option<f64>,
+    /// Token usage (optional; absent on older CLI versions / error responses).
+    pub(crate) usage: Option<ClaudeUsage>,
 }
 
 /// Validate a parsed `ClaudeCliResponse` and extract a `ChatReply`.
@@ -74,6 +85,11 @@ pub fn validate_claude_response(
         });
     }
 
+    let tokens = response
+        .usage
+        .as_ref()
+        .map(|u| u.input_tokens + u.output_tokens);
+
     let text = response.result.ok_or_else(|| AppError::ClaudeCli {
         subtype: "empty".into(),
         message: "claude CLI returned success with no result text".into(),
@@ -82,6 +98,7 @@ pub fn validate_claude_response(
     Ok(ChatReply {
         text,
         cost_usd: response.total_cost_usd,
+        tokens,
     })
 }
 
@@ -105,10 +122,7 @@ impl LlmClient {
                 http,
             } => {
                 let _ = timeout_secs; // HTTP client timeout configured at build time
-                super::openai_compat::do_complete(
-                    base_url, api_key, model, http, &request,
-                )
-                .await
+                super::openai_compat::do_complete(base_url, api_key, model, http, &request).await
             }
             LlmClient::AnthropicCli { model, claude_bin } => {
                 anthropic_complete(claude_bin, model, request, timeout_secs).await
@@ -232,9 +246,7 @@ async fn anthropic_complete(
     if !exit_status.success() {
         return Err(AppError::ClaudeCli {
             subtype: "exit".into(),
-            message: format!(
-                "claude CLI exited with {exit_status}. stderr: {stderr_str}"
-            ),
+            message: format!("claude CLI exited with {exit_status}. stderr: {stderr_str}"),
         });
     }
 
@@ -249,9 +261,7 @@ async fn anthropic_complete(
         };
         AppError::ClaudeCli {
             subtype: "parse".into(),
-            message: format!(
-                "Failed to parse claude JSON output ({e}). Raw output: {snippet}"
-            ),
+            message: format!("Failed to parse claude JSON output ({e}). Raw output: {snippet}"),
         }
     })?;
 
@@ -315,5 +325,38 @@ mod tests {
         let resp: ClaudeCliResponse = serde_json::from_slice(json).unwrap();
         assert!(!resp.is_error);
         assert_eq!(resp.subtype, "success");
+    }
+
+    /// Verify that `usage` (input + output tokens) is parsed and summed into
+    /// `ChatReply.tokens` when present.
+    #[test]
+    fn test_validate_claude_response_parses_usage_tokens() {
+        let json = br#"{
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "result": "ok",
+            "total_cost_usd": 0.01,
+            "usage": { "input_tokens": 120, "output_tokens": 30 }
+        }"#;
+        let resp: ClaudeCliResponse = serde_json::from_slice(json).unwrap();
+        let reply = validate_claude_response(resp, "").unwrap();
+        assert_eq!(reply.tokens, Some(150));
+    }
+
+    /// Verify that a response with no `usage` block yields `tokens: None`
+    /// (back-compat with older CLI output) and does not fail to deserialize.
+    #[test]
+    fn test_validate_claude_response_absent_usage_is_none() {
+        let json = br#"{
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "result": "ok",
+            "total_cost_usd": 0.01
+        }"#;
+        let resp: ClaudeCliResponse = serde_json::from_slice(json).unwrap();
+        let reply = validate_claude_response(resp, "").unwrap();
+        assert_eq!(reply.tokens, None);
     }
 }

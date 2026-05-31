@@ -2,7 +2,7 @@ use std::process::ExitCode;
 
 use thiserror::Error;
 
-/// All error types for the agentic-inferno spectacle tool.
+/// All error types for the agentic-inferno tool.
 ///
 /// Errors are user-actionable — messages tell the user what went wrong
 /// and what to do next. This is library code; `anyhow` is reserved for
@@ -19,10 +19,7 @@ pub enum AppError {
 
     /// An HTTP error was returned by a provider API.
     #[error("HTTP {status}: {body}")]
-    Http {
-        status: u16,
-        body: String,
-    },
+    Http { status: u16, body: String },
 
     /// A network/transport error occurred (connection refused, DNS failure, etc.).
     #[error("Network error: {0}")]
@@ -34,17 +31,11 @@ pub enum AppError {
 
     /// The `claude` CLI returned an error (is_error, unexpected subtype, or non-zero exit).
     #[error("Claude CLI error ({subtype}): {message}")]
-    ClaudeCli {
-        subtype: String,
-        message: String,
-    },
+    ClaudeCli { subtype: String, message: String },
 
     /// A shell script exited with a non-zero code (reserved for future use).
     #[error("Script exited with code {code}: {stderr}")]
-    Script {
-        code: i32,
-        stderr: String,
-    },
+    Script { code: i32, stderr: String },
 
     /// An I/O error occurred (file not found, permission denied, etc.).
     #[error("I/O error: {0}")]
@@ -75,7 +66,9 @@ pub enum AppError {
     Validation(String),
 
     /// The terminal is too small for the TUI layout.
-    #[error("Terminal too small: {0}x{1}. Minimum size is 80x24. Resize your terminal and try again.")]
+    #[error(
+        "Terminal too small: {0}x{1}. Minimum size is 80x24. Resize your terminal and try again."
+    )]
     TerminalTooSmall(usize, usize),
 }
 
@@ -225,15 +218,24 @@ mod tests {
         }
 
         // Config/user errors → 64
-        assert_eq!(to_exit_code(AppError::MissingKey("X".into())), ExitCode::from(64));
+        assert_eq!(
+            to_exit_code(AppError::MissingKey("X".into())),
+            ExitCode::from(64)
+        );
         assert_eq!(
             to_exit_code(AppError::UnknownModel("x".into(), "Writer".into())),
             ExitCode::from(64)
         );
         assert_eq!(to_exit_code(AppError::MissingInput), ExitCode::from(64));
-        assert_eq!(to_exit_code(AppError::LeakGuard("x".into())), ExitCode::from(64));
+        assert_eq!(
+            to_exit_code(AppError::LeakGuard("x".into())),
+            ExitCode::from(64)
+        );
         assert_eq!(to_exit_code(AppError::ClaudeNotFound), ExitCode::from(64));
-        assert_eq!(to_exit_code(AppError::TerminalTooSmall(40, 10)), ExitCode::from(64));
+        assert_eq!(
+            to_exit_code(AppError::TerminalTooSmall(40, 10)),
+            ExitCode::from(64)
+        );
         assert_eq!(
             to_exit_code(AppError::Validation("bad".into())),
             ExitCode::from(64)

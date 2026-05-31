@@ -6,11 +6,11 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 use crate::app::AppEvent;
-use crate::config::Config;
+use crate::config::{Config, InfernoTask};
 use crate::error::AppError;
 use crate::guards::{semantic_hash, CostCeiling, LoopDetection};
-use crate::prompts::{self, APOLOGY_SYSTEM_PROMPT, WRITER_SYSTEM_PROMPT};
-use crate::providers::{detect_provider, ChatRequest, LlmClient, Provider};
+use crate::prompts::{self, APOLOGY_SYSTEM_PROMPT};
+use crate::providers::{detect_provider, resolve_claude_bin, ChatRequest, LlmClient, Provider};
 use crate::state::{ApologyCooldown, SharedState};
 
 // ---------------------------------------------------------------------------
@@ -30,6 +30,40 @@ const CYCLE_SLEEP_MS: u64 = 500;
 /// management — we only need to stay within ~10% of the model's limit.
 fn estimate_tokens(text: &str) -> usize {
     text.len() / 4
+}
+
+/// Resolve the token count for a call: use the provider-reported value when
+/// present, otherwise estimate from the request text plus the reply text.
+///
+/// `user_est` is the pre-computed `estimate_tokens(request_user)` (computed
+/// before the request is moved), so the estimate stays consistent with the
+/// context-window heuristic.
+fn resolve_call_tokens(reply_tokens: Option<u64>, user_est: u64, reply_text: &str) -> u64 {
+    reply_tokens.unwrap_or(user_est + estimate_tokens(reply_text) as u64)
+}
+
+// ---------------------------------------------------------------------------
+// Token accounting
+// ---------------------------------------------------------------------------
+
+/// Per-agent cumulative token totals, shared across the Writer, Critic, and
+/// Apology tasks via `Arc<Mutex<TokenTotals>>`.
+///
+/// Unlike cost (which has a shared ceiling tracking the true total), token
+/// totals have no shared running sum, so each agent must update only its own
+/// field and read all three at emit time to send the true cumulative figures.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TokenTotals {
+    pub writer: u64,
+    pub critic: u64,
+    pub apology: u64,
+}
+
+impl TokenTotals {
+    /// Sum of all per-agent totals.
+    pub fn total(&self) -> u64 {
+        self.writer + self.critic + self.apology
+    }
 }
 
 /// Estimate the model's context window size in tokens from its name.
@@ -52,11 +86,11 @@ fn estimate_model_context_window(model: &str) -> usize {
 // Orchestrator entry point
 // ---------------------------------------------------------------------------
 
-/// Launch the Writer and Critic spectacle loops concurrently.
+/// Launch the Writer and Critic loops concurrently.
 ///
 /// Both loops share the same [`SharedState`] and [`CancellationToken`]. The
 /// Writer continuously revises the document while the Critic independently
-/// inspects the latest version and produces entertainment-only commentary.
+/// reads the latest version and produces commentary.
 ///
 /// # Lifecycle
 ///
@@ -72,7 +106,14 @@ pub async fn run_spectacle(
     event_tx: UnboundedSender<AppEvent>,
     cancel_token: CancellationToken,
 ) -> Result<(), AppError> {
-    let initial_content = std::fs::read_to_string(&config.input)?;
+    // Seed the shared document. Non-prompt tasks read the input file; prompt
+    // mode has no input file, so the document starts empty and evolves as the
+    // Writer attempts the prompt.
+    let initial_content = if config.task == InfernoTask::Prompt {
+        String::new()
+    } else {
+        std::fs::read_to_string(&config.input)?
+    };
 
     state.update(initial_content.clone());
     let _ = event_tx.send(AppEvent::WriterOutput(initial_content));
@@ -83,17 +124,22 @@ pub async fn run_spectacle(
     // ── Cost ceiling guard ───────────────────────────────────────────
     // Shared across Writer, Critic, and Apology loops. Each successful
     // LLM call records its cost. If the ceiling is exceeded the token is
-    // cancelled and the spectacle stops.
+    // cancelled and the loops stop.
 
     let cost_ceiling = Arc::new(CostCeiling::new(config.max_cost_usd));
     let writer_cost: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
     let critic_cost: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
     let _apology_cost: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
 
+    // ── Token accounting ─────────────────────────────────────────────
+    // One shared accumulator. Each agent updates its own field and reads all
+    // three at emit time so every `TokenUsage` event carries the true totals.
+    let token_totals: Arc<Mutex<TokenTotals>> = Arc::new(Mutex::new(TokenTotals::default()));
+
     // ── Spawn concurrent Writer + Critic loops ───────────────────────
     // JoinHandles are retained so we can await graceful shutdown.
 
-    // Per-spectacle loop detection: window=5, min_repeats=3.
+    // Per-run loop detection: window=5, min_repeats=3.
     let loop_detector = Arc::new(Mutex::new(LoopDetection::new(5, 3)));
 
     let writer_handle = {
@@ -104,6 +150,7 @@ pub async fn run_spectacle(
         let writer_cc = Arc::clone(&cost_ceiling);
         let writer_ac = Arc::clone(&writer_cost);
         let writer_ld = Arc::clone(&loop_detector);
+        let writer_tt = Arc::clone(&token_totals);
 
         tokio::spawn(async move {
             writer_loop(
@@ -115,6 +162,7 @@ pub async fn run_spectacle(
                 writer_cc,
                 writer_ac,
                 writer_ld,
+                writer_tt,
             )
             .await;
         })
@@ -127,6 +175,7 @@ pub async fn run_spectacle(
         let critic_config = config;
         let critic_cc = Arc::clone(&cost_ceiling);
         let critic_ac = Arc::clone(&critic_cost);
+        let critic_tt = Arc::clone(&token_totals);
 
         tokio::spawn(async move {
             critic_loop(
@@ -137,6 +186,7 @@ pub async fn run_spectacle(
                 critic_config,
                 critic_cc,
                 critic_ac,
+                critic_tt,
             )
             .await;
         })
@@ -171,14 +221,11 @@ pub async fn run_spectacle(
 
     const SHUTDOWN_GRACE_SECS: u64 = 3;
 
-    let join_result = tokio::time::timeout(
-        Duration::from_secs(SHUTDOWN_GRACE_SECS),
-        async {
-            let writer_result = writer_handle.await;
-            let critic_result = critic_handle.await;
-            (writer_result, critic_result)
-        },
-    )
+    let join_result = tokio::time::timeout(Duration::from_secs(SHUTDOWN_GRACE_SECS), async {
+        let writer_result = writer_handle.await;
+        let critic_result = critic_handle.await;
+        (writer_result, critic_result)
+    })
     .await;
 
     match join_result {
@@ -186,14 +233,10 @@ pub async fn run_spectacle(
             // Both loops exited cleanly — normal fast path.
         }
         Ok((Err(writer_join_err), _)) => {
-            eprintln!(
-                "Orchestrator: Writer loop panicked during shutdown: {writer_join_err}"
-            );
+            eprintln!("Orchestrator: Writer loop panicked during shutdown: {writer_join_err}");
         }
         Ok((_, Err(critic_join_err))) => {
-            eprintln!(
-                "Orchestrator: Critic loop panicked during shutdown: {critic_join_err}"
-            );
+            eprintln!("Orchestrator: Critic loop panicked during shutdown: {critic_join_err}");
         }
         Err(_elapsed) => {
             // Tier 2 escalation: loops didn't exit within the grace period.
@@ -261,6 +304,33 @@ pub fn cooldown_remaining_secs(cooldown: &ApologyCooldown) -> Option<u64> {
 ///
 /// Uses a `tokio::select!` on the `cancel_token.cancelled()` future and a
 /// short sleep so the loop responds to cancellation within ~500ms.
+/// Add `delta` tokens to the agent's slot in the shared accumulator and emit a
+/// `TokenUsage` event carrying the true cumulative totals for all three agents.
+///
+/// `which` selects the slot: `0` writer, `1` critic, `2` apology.
+fn record_and_emit_tokens(
+    totals: &Arc<Mutex<TokenTotals>>,
+    event_tx: &UnboundedSender<AppEvent>,
+    which: u8,
+    delta: u64,
+) {
+    let snapshot = {
+        let mut t = totals.lock().expect("token_totals mutex poisoned");
+        match which {
+            0 => t.writer += delta,
+            1 => t.critic += delta,
+            _ => t.apology += delta,
+        }
+        *t
+    };
+    let _ = event_tx.send(AppEvent::TokenUsage {
+        writer: snapshot.writer,
+        critic: snapshot.critic,
+        apology: snapshot.apology,
+        total: snapshot.total(),
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn writer_loop(
     client: LlmClient,
@@ -271,9 +341,11 @@ async fn writer_loop(
     cost_ceiling: Arc<CostCeiling>,
     writer_cost: Arc<Mutex<f64>>,
     loop_detector: Arc<Mutex<LoopDetection>>,
+    token_totals: Arc<Mutex<TokenTotals>>,
 ) {
     // ── Context window management ─────────────────────────────────────────
     let model_context_window = estimate_model_context_window(&config.writer_model);
+    let writer_system_prompt = prompts::writer_system(config.task);
     let mut critique_history: VecDeque<(String, usize)> = VecDeque::new();
 
     loop {
@@ -303,7 +375,7 @@ async fn writer_loop(
         }
 
         // ── Context window check — warn at 80%, prune oldest at 90% ──────
-        let system_tokens = estimate_tokens(WRITER_SYSTEM_PROMPT);
+        let system_tokens = estimate_tokens(writer_system_prompt);
         let doc_tokens = estimate_tokens(&current_content);
         let crit_tokens_total: usize = critique_history.iter().map(|(_, t)| t).sum();
         let current_estimate = system_tokens + doc_tokens + crit_tokens_total;
@@ -332,10 +404,23 @@ async fn writer_loop(
             critique_context.push_str("Now revise the document accordingly.");
         }
 
-        let prompt_text = format!("{current_content}{critique_context}");
+        // In prompt mode the user message frames the prompt as the goal and the
+        // shared document as the evolving attempt. Other tasks pass the document
+        // itself as the thing being revised.
+        let prompt_text = match (config.task, config.prompt.as_deref()) {
+            (InfernoTask::Prompt, Some(prompt)) => format!(
+                "Task: {prompt}\n\nCurrent attempt:\n{current_content}\n\nKeep working on it.{critique_context}"
+            ),
+            _ => format!("{current_content}{critique_context}"),
+        };
+
+        // Pre-compute the user-side token estimate before `prompt_text` is
+        // moved into the request — used for the fallback when the API omits
+        // usage data.
+        let user_est = estimate_tokens(&prompt_text) as u64;
 
         let request = ChatRequest {
-            system: WRITER_SYSTEM_PROMPT.to_string(),
+            system: writer_system_prompt.to_string(),
             user: prompt_text,
             model: config.writer_model.clone(),
             temperature: config.temperature as f32,
@@ -344,6 +429,12 @@ async fn writer_loop(
 
         match client.complete(request, config.timeout_secs).await {
             Ok(reply) => {
+                // Record token usage unconditionally (cost may be absent, e.g.
+                // OpenAI omits `total_cost_usd`, but token usage is the meter's
+                // whole point). Compute before `reply.text` is moved.
+                let call_tokens = resolve_call_tokens(reply.tokens, user_est, &reply.text);
+                record_and_emit_tokens(&token_totals, &event_tx, 0, call_tokens);
+
                 if let Some(cost) = reply.cost_usd {
                     // Track per-agent cost (only on success).
                     *writer_cost.lock().expect("writer_cost mutex poisoned") += cost;
@@ -357,9 +448,8 @@ async fn writer_loop(
                     if let Err(AppError::CostCeilingExceeded(spent, limit)) =
                         cost_ceiling.record(cost)
                     {
-                        let _ = event_tx.send(AppEvent::Error(AppError::CostCeilingExceeded(
-                            spent, limit,
-                        )));
+                        let _ = event_tx
+                            .send(AppEvent::Error(AppError::CostCeilingExceeded(spent, limit)));
                         cancel_token.cancel();
                         break;
                     }
@@ -378,7 +468,7 @@ async fn writer_loop(
                 // split the response: the document part goes into shared state
                 // and the apology text is sent to the apology bar via ApologyReady,
                 // gated by the cooldown.  The full text (including the marker)
-                // always goes to the Writer pane for audience spectacle.
+                // always goes to the Writer pane.
                 let new_version = if let Some(marker_idx) = find_apology_marker(&reply.text) {
                     let document_text = reply.text[..marker_idx].trim().to_string();
 
@@ -397,8 +487,8 @@ async fn writer_loop(
 
                     let new_ver = state.update(document_text);
 
-                    // The full text (including the marker) goes to the TUI for
-                    // display — the audience should see the theatrical apology.
+                    // The full text (including the marker) goes to the TUI so
+                    // the apology is shown alongside the revision.
                     let _ = event_tx.send(AppEvent::WriterOutput(reply.text));
                     let _ = event_tx.send(AppEvent::WriterDone(new_ver));
                     let _ = event_tx.send(AppEvent::ApologyTriggered);
@@ -413,6 +503,7 @@ async fn writer_loop(
                         let apology_event_tx = event_tx.clone();
                         let apology_config = config.clone();
                         let apology_ceiling = Arc::clone(&cost_ceiling);
+                        let apology_tt = Arc::clone(&token_totals);
 
                         tokio::spawn(async move {
                             match build_client(
@@ -425,6 +516,8 @@ async fn writer_loop(
                                         .read_critique()
                                         .map(|(_, text)| text)
                                         .unwrap_or_default();
+
+                                    let apology_user_est = estimate_tokens(&critique_text) as u64;
 
                                     let request = ChatRequest {
                                         system: APOLOGY_SYSTEM_PROMPT.to_string(),
@@ -439,28 +532,37 @@ async fn writer_loop(
                                         .await
                                     {
                                         Ok(reply) => {
+                                            let call_tokens = resolve_call_tokens(
+                                                reply.tokens,
+                                                apology_user_est,
+                                                &reply.text,
+                                            );
+                                            record_and_emit_tokens(
+                                                &apology_tt,
+                                                &apology_event_tx,
+                                                2,
+                                                call_tokens,
+                                            );
                                             if let Some(cost) = reply.cost_usd {
                                                 if let Err(err) = apology_ceiling.record(cost) {
-                                                    let _ = apology_event_tx
-                                                        .send(AppEvent::Error(err));
+                                                    let _ =
+                                                        apology_event_tx.send(AppEvent::Error(err));
                                                     return;
                                                 }
-                                                let _ = apology_event_tx.send(
-                                                    AppEvent::CostWarning {
+                                                let _ =
+                                                    apology_event_tx.send(AppEvent::CostWarning {
                                                         spent: apology_ceiling.spent(),
                                                         limit: apology_ceiling.limit(),
                                                         writer_cost: 0.0,
                                                         critic_cost: 0.0,
                                                         apology_cost: cost,
-                                                    },
-                                                );
+                                                    });
                                             }
                                             let _ = apology_event_tx
                                                 .send(AppEvent::ApologyReady(reply.text));
                                         }
                                         Err(err) => {
-                                            let _ = apology_event_tx
-                                                .send(AppEvent::Error(err));
+                                            let _ = apology_event_tx.send(AppEvent::Error(err));
                                         }
                                     }
                                 }
@@ -536,6 +638,7 @@ async fn writer_loop(
 /// # Cancellation
 ///
 /// Same `tokio::select!` pattern as the Writer loop — responds within ~500ms.
+#[allow(clippy::too_many_arguments)]
 async fn critic_loop(
     client: LlmClient,
     state: SharedState,
@@ -544,6 +647,7 @@ async fn critic_loop(
     config: Config,
     cost_ceiling: Arc<CostCeiling>,
     critic_cost: Arc<Mutex<f64>>,
+    token_totals: Arc<Mutex<TokenTotals>>,
 ) {
     loop {
         if cancel_token.is_cancelled() {
@@ -553,6 +657,9 @@ async fn critic_loop(
         let (doc_version, doc_content) = state.snapshot();
 
         let critic_system = prompts::critics(config.critic_style).to_string();
+
+        // Pre-compute the user-side estimate before `doc_content` is moved.
+        let user_est = estimate_tokens(&doc_content) as u64;
 
         let request = ChatRequest {
             system: critic_system,
@@ -564,6 +671,10 @@ async fn critic_loop(
 
         match client.complete(request, config.timeout_secs).await {
             Ok(reply) => {
+                // Record token usage unconditionally (before `reply.text` moves).
+                let call_tokens = resolve_call_tokens(reply.tokens, user_est, &reply.text);
+                record_and_emit_tokens(&token_totals, &event_tx, 1, call_tokens);
+
                 if let Some(cost) = reply.cost_usd {
                     // Track per-agent cost (only on success).
                     *critic_cost.lock().expect("critic_cost mutex poisoned") += cost;
@@ -577,9 +688,8 @@ async fn critic_loop(
                     if let Err(AppError::CostCeilingExceeded(spent, limit)) =
                         cost_ceiling.record(cost)
                     {
-                        let _ = event_tx.send(AppEvent::Error(AppError::CostCeilingExceeded(
-                            spent, limit,
-                        )));
+                        let _ = event_tx
+                            .send(AppEvent::Error(AppError::CostCeilingExceeded(spent, limit)));
                         cancel_token.cancel();
                         break;
                     }
@@ -605,8 +715,10 @@ async fn critic_loop(
 
                 state.write_critique(doc_version, reply.text.clone());
 
-                let _ = event_tx.send(AppEvent::CriticOutput(reply.text));
+                // Emit CritiqueReady first so `app.critic_version` is current
+                // when `apply_critic_output` builds the `── vN ──` header.
                 let _ = event_tx.send(AppEvent::CritiqueReady(doc_version));
+                let _ = event_tx.send(AppEvent::CriticOutput(reply.text));
 
                 // Increment apology cooldown cycle counter — each successful
                 // critic cycle brings us closer to satisfying the 3-cycle minimum.
@@ -645,17 +757,13 @@ fn build_critic_client(config: &Config) -> Result<LlmClient, AppError> {
 /// Detects the provider from the model name, reads the API key from the
 /// environment, resolves the base URL (config override → env var → default),
 /// and constructs the appropriate client variant.
-fn build_client(
-    model: &str,
-    agent_name: &str,
-    config: &Config,
-) -> Result<LlmClient, AppError> {
+fn build_client(model: &str, agent_name: &str, config: &Config) -> Result<LlmClient, AppError> {
     let (provider, model_name) = detect_provider(model, agent_name)?;
 
     match provider {
         Provider::Anthropic => Ok(LlmClient::AnthropicCli {
             model: model_name,
-            claude_bin: "claude".to_string(),
+            claude_bin: resolve_claude_bin(),
         }),
         _ => {
             let env_var = provider.api_key_env_var();
@@ -747,4 +855,76 @@ pub fn count_harsh_keywords(text: &str) -> usize {
     ];
     let lower = text.to_ascii_lowercase();
     KEYWORDS.iter().filter(|kw| lower.contains(*kw)).count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_call_tokens_uses_provider_value_when_present() {
+        // When the provider reports tokens, use them verbatim and ignore the
+        // estimate.
+        let n = resolve_call_tokens(Some(1234), 999, "this text is ignored");
+        assert_eq!(n, 1234);
+    }
+
+    #[test]
+    fn resolve_call_tokens_falls_back_to_estimate() {
+        // 40 chars / 4 = 10 reply tokens; plus the user estimate.
+        let reply = "x".repeat(40);
+        let n = resolve_call_tokens(None, 7, &reply);
+        assert_eq!(n, 7 + estimate_tokens(&reply) as u64);
+        assert_eq!(n, 17);
+    }
+
+    #[test]
+    fn token_totals_sum_is_correct() {
+        let t = TokenTotals {
+            writer: 100,
+            critic: 50,
+            apology: 25,
+        };
+        assert_eq!(t.total(), 175);
+    }
+
+    #[test]
+    fn record_and_emit_tokens_carries_true_cumulative_totals() {
+        // Locks the no-flicker contract: updating one agent's slot leaves the
+        // others intact, and each emit carries the true cumulative totals + sum.
+        let totals = Arc::new(Mutex::new(TokenTotals::default()));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        record_and_emit_tokens(&totals, &tx, 0, 100); // writer += 100
+        record_and_emit_tokens(&totals, &tx, 1, 50); // critic += 50
+        record_and_emit_tokens(&totals, &tx, 2, 25); // apology += 25
+        record_and_emit_tokens(&totals, &tx, 0, 10); // writer += 10 → 110
+
+        // The final accumulator state reflects all four updates.
+        let snapshot = *totals.lock().unwrap();
+        assert_eq!(snapshot.writer, 110);
+        assert_eq!(snapshot.critic, 50);
+        assert_eq!(snapshot.apology, 25);
+
+        // The last event must carry the true cumulative totals, not just the
+        // one agent that changed.
+        let mut last = None;
+        while let Ok(ev) = rx.try_recv() {
+            last = Some(ev);
+        }
+        match last.expect("at least one TokenUsage event") {
+            AppEvent::TokenUsage {
+                writer,
+                critic,
+                apology,
+                total,
+            } => {
+                assert_eq!(writer, 110);
+                assert_eq!(critic, 50);
+                assert_eq!(apology, 25);
+                assert_eq!(total, 185);
+            }
+            other => panic!("expected TokenUsage, got {other:?}"),
+        }
+    }
 }

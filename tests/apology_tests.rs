@@ -12,7 +12,7 @@
 use std::time::{Duration, Instant};
 
 use agentic_inferno::orchestrator::{
-    count_harsh_keywords, cooldown_remaining_secs, find_apology_marker,
+    cooldown_remaining_secs, count_harsh_keywords, find_apology_marker,
 };
 use agentic_inferno::state::ApologyCooldown;
 
@@ -66,7 +66,10 @@ fn test_marker_in_middle_of_text() {
 #[test]
 fn test_marker_with_extra_whitespace_not_matched() {
     let text = "[APOLOGY ]";
-    assert!(find_apology_marker(text).is_none(), "space before ] should not match");
+    assert!(
+        find_apology_marker(text).is_none(),
+        "space before ] should not match"
+    );
 }
 
 /// Only the opening bracket without the closing one → not matched.
@@ -90,7 +93,10 @@ fn test_plain_word_apology_not_matched() {
 /// No harsh keywords → count is 0.
 #[test]
 fn test_zero_harsh_keywords() {
-    assert_eq!(count_harsh_keywords("This is a kind and gentle critique."), 0);
+    assert_eq!(
+        count_harsh_keywords("This is a kind and gentle critique."),
+        0
+    );
 }
 
 /// Single keyword → count is 1.
@@ -111,10 +117,7 @@ fn test_two_harsh_keywords_below_threshold() {
 /// Three keywords → at the threshold (≥3 fires the trigger).
 #[test]
 fn test_three_harsh_keywords_at_threshold() {
-    assert_eq!(
-        count_harsh_keywords("incompetent, worthless, pathetic"),
-        3
-    );
+    assert_eq!(count_harsh_keywords("incompetent, worthless, pathetic"), 3);
 }
 
 /// Four keywords → still counted correctly.
@@ -143,8 +146,16 @@ fn test_keywords_case_insensitive() {
 /// This is a known characteristic of the current implementation.
 #[test]
 fn test_keyword_substring_matches() {
-    assert_eq!(count_harsh_keywords("uselessly"), 1, "\"uselessly\" contains \"useless\"");
-    assert_eq!(count_harsh_keywords("disgraceful"), 1, "\"disgraceful\" contains \"disgrace\"");
+    assert_eq!(
+        count_harsh_keywords("uselessly"),
+        1,
+        "\"uselessly\" contains \"useless\""
+    );
+    assert_eq!(
+        count_harsh_keywords("disgraceful"),
+        1,
+        "\"disgraceful\" contains \"disgrace\""
+    );
 }
 
 /// Empty string → no keywords.
@@ -180,9 +191,15 @@ fn test_cooldown_immediately_after_apology() {
         cycles_since_apology: 0,
     };
     let remaining = cooldown_remaining_secs(&cd);
-    assert!(remaining.is_some(), "cooldown should be active immediately after apology");
+    assert!(
+        remaining.is_some(),
+        "cooldown should be active immediately after apology"
+    );
     let secs = remaining.unwrap();
-    assert!((1..=30).contains(&secs), "remaining should be between 1 and 30, got {secs}");
+    assert!(
+        (1..=30).contains(&secs),
+        "remaining should be between 1 and 30, got {secs}"
+    );
 }
 
 /// Apology 15 seconds ago → cooldown returns ~15s remaining.
@@ -196,7 +213,10 @@ fn test_cooldown_fifteen_seconds_ago() {
     assert!(remaining.is_some(), "cooldown should be active at t=15s");
     let secs = remaining.unwrap();
     // Elapsed could be 15-16s depending on timing, so remaining is 14-15s.
-    assert!((13..=16).contains(&secs), "remaining should be ~15s, got {secs}");
+    assert!(
+        (13..=16).contains(&secs),
+        "remaining should be ~15s, got {secs}"
+    );
 }
 
 /// Apology 30+ seconds ago but only 2 cycles elapsed → cooldown returns Some(0)
@@ -245,7 +265,10 @@ fn test_cooldown_cycles_met_time_not_met() {
         cycles_since_apology: 3,
     };
     let remaining = cooldown_remaining_secs(&cd);
-    assert!(remaining.is_some(), "time condition not met, cooldown should be active");
+    assert!(
+        remaining.is_some(),
+        "time condition not met, cooldown should be active"
+    );
     // elapsed ≈ 29s (could be 29-30), so remaining ≈ 1-2s.
     let secs = remaining.unwrap();
     assert!(secs <= 2, "remaining should be ~1s, got {secs}");
@@ -288,8 +311,14 @@ fn test_apology_cooldown_debug_format() {
         cycles_since_apology: 1,
     };
     let debug_str = format!("{cd:?}");
-    assert!(debug_str.contains("last_apology_time"), "Debug output should include field names");
-    assert!(debug_str.contains("cycles_since_apology"), "Debug output should include field names");
+    assert!(
+        debug_str.contains("last_apology_time"),
+        "Debug output should include field names"
+    );
+    assert!(
+        debug_str.contains("cycles_since_apology"),
+        "Debug output should include field names"
+    );
 }
 
 /// Default cooldown displays properly.
@@ -297,7 +326,10 @@ fn test_apology_cooldown_debug_format() {
 fn test_default_cooldown_debug_format() {
     let cd = ApologyCooldown::default();
     let dbg = format!("{cd:?}");
-    assert!(dbg.contains("None"), "default cooldown has no last_apology_time");
+    assert!(
+        dbg.contains("None"),
+        "default cooldown has no last_apology_time"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -307,10 +339,7 @@ fn test_default_cooldown_debug_format() {
 /// Keyword detection with mixed punctuation and spacing works correctly.
 #[test]
 fn test_keywords_with_punctuation() {
-    assert_eq!(
-        count_harsh_keywords("Incompetent! Worthless? Pathetic."),
-        3
-    );
+    assert_eq!(count_harsh_keywords("Incompetent! Worthless? Pathetic."), 3);
 }
 
 /// Multiple markers in the same text — returns index of first occurrence.

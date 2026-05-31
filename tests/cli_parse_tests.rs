@@ -3,12 +3,11 @@ use agentic_inferno::providers::anthropic_cli::{validate_claude_response, Claude
 use agentic_inferno::providers::ChatReply;
 
 fn parse_and_validate(json_bytes: &[u8]) -> Result<ChatReply, AppError> {
-    let response: ClaudeCliResponse = serde_json::from_slice(json_bytes).map_err(|e| {
-        AppError::ClaudeCli {
+    let response: ClaudeCliResponse =
+        serde_json::from_slice(json_bytes).map_err(|e| AppError::ClaudeCli {
             subtype: "parse".into(),
             message: format!("Failed to parse claude JSON output ({e})."),
-        }
-    })?;
+        })?;
     validate_claude_response(response, "")
 }
 
@@ -154,8 +153,14 @@ fn test_non_zero_exit_maps_to_claude_cli() {
     };
 
     let msg = err.to_string();
-    assert!(msg.contains("exit"), "error message should mention exit: {msg}");
-    assert!(msg.contains("some error"), "error message should include stderr: {msg}");
+    assert!(
+        msg.contains("exit"),
+        "error message should mention exit: {msg}"
+    );
+    assert!(
+        msg.contains("some error"),
+        "error message should include stderr: {msg}"
+    );
 }
 
 #[test]

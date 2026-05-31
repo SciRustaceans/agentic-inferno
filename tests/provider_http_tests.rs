@@ -37,11 +37,9 @@ async fn test_200_success_returns_chat_reply() {
 
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({
-                "choices": [{"message": {"content": "Hello, world!"}}],
-            })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "Hello, world!"}}],
+        })))
         .mount(&mock_server)
         .await;
 
@@ -60,12 +58,10 @@ async fn test_200_with_cost_usd() {
 
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({
-                "choices": [{"message": {"content": "Costly response"}}],
-                "total_cost_usd": 0.042,
-            })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "Costly response"}}],
+            "total_cost_usd": 0.042,
+        })))
         .mount(&mock_server)
         .await;
 
@@ -94,8 +90,14 @@ async fn test_401_returns_missing_key() {
 
     match err {
         AppError::MissingKey(msg) => {
-            assert!(msg.contains("401"), "MissingKey message should mention 401: {msg}");
-            assert!(msg.contains("invalid key"), "MissingKey message should include body: {msg}");
+            assert!(
+                msg.contains("401"),
+                "MissingKey message should mention 401: {msg}"
+            );
+            assert!(
+                msg.contains("invalid key"),
+                "MissingKey message should include body: {msg}"
+            );
         }
         other => panic!("expected MissingKey, got {other:?}"),
     }
@@ -206,11 +208,9 @@ async fn test_json_missing_content_returns_http_error() {
 
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({
-                "choices": [{"message": {}}],
-            })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {}}],
+        })))
         .expect(1)
         .mount(&mock_server)
         .await;
@@ -252,7 +252,10 @@ async fn test_timeout_returns_timeout_error() {
     };
 
     let err = client.complete(make_request(), 30).await.unwrap_err();
-    assert!(matches!(err, AppError::Timeout), "expected Timeout, got {err:?}");
+    assert!(
+        matches!(err, AppError::Timeout),
+        "expected Timeout, got {err:?}"
+    );
 }
 
 // ── Request body shape validation ────────────────────────────────────
@@ -272,11 +275,9 @@ async fn test_request_body_has_expected_shape() {
             "temperature": 1.0,
             "max_tokens": 1024,
         })))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({
-                "choices": [{"message": {"content": "shape matches"}}],
-            })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "shape matches"}}],
+        })))
         .expect(1)
         .mount(&mock_server)
         .await;
@@ -308,11 +309,9 @@ async fn test_request_body_shape_different_request() {
             "temperature": 0.5,
             "max_tokens": 512,
         })))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({
-                "choices": [{"message": {"content": "different request matched"}}],
-            })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "different request matched"}}],
+        })))
         .expect(1)
         .mount(&mock_server)
         .await;
@@ -348,11 +347,9 @@ async fn test_bearer_header_present() {
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .and(header("Authorization", "Bearer sk-test-key"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({
-                "choices": [{"message": {"content": "header ok"}}],
-            })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "header ok"}}],
+        })))
         .expect(1)
         .mount(&mock_server)
         .await;
@@ -369,11 +366,9 @@ async fn test_wrong_bearer_header_not_accepted() {
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .and(header("Authorization", "Bearer wrong-key"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({
-                "choices": [{"message": {"content": "should not match"}}],
-            })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "should not match"}}],
+        })))
         .expect(0)
         .mount(&mock_server)
         .await;
@@ -381,5 +376,8 @@ async fn test_wrong_bearer_header_not_accepted() {
     let client = make_client(&mock_server, 30);
 
     let result = client.complete(make_request(), 30).await;
-    assert!(result.is_err(), "wrong bearer header should not match any mock");
+    assert!(
+        result.is_err(),
+        "wrong bearer header should not match any mock"
+    );
 }

@@ -6,7 +6,7 @@ use clap::Parser;
 use serde::Deserialize;
 
 use crate::error::AppError;
-use crate::providers::{detect_provider, Provider};
+use crate::providers::{detect_provider, resolve_claude_bin, Provider};
 
 // ---------------------------------------------------------------------------
 // CriticStyle
@@ -87,10 +87,68 @@ impl clap::ValueEnum for CriticStyle {
 }
 
 // ---------------------------------------------------------------------------
+// InfernoTask
+// ---------------------------------------------------------------------------
+
+/// The kind of work the Writer agent is set loose on.
+///
+/// `Prompt` is the "guided" mode: the Writer is handed a free-form task it can
+/// never fully complete and keeps attempting it forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InfernoTask {
+    /// Revise a piece of prose. The default.
+    #[default]
+    Writing,
+    /// Revise or rewrite a code file.
+    Code,
+    /// Expand a research write-up.
+    Research,
+    /// Re-analyse material and draw conclusions.
+    Analysis,
+    /// Attempt a free-form prompt that can never be fully completed.
+    Prompt,
+}
+
+impl fmt::Display for InfernoTask {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            InfernoTask::Writing => write!(f, "writing"),
+            InfernoTask::Code => write!(f, "code"),
+            InfernoTask::Research => write!(f, "research"),
+            InfernoTask::Analysis => write!(f, "analysis"),
+            InfernoTask::Prompt => write!(f, "prompt"),
+        }
+    }
+}
+
+// clap::ValueEnum for CLI parsing — uses kebab-case (single-word) values.
+impl clap::ValueEnum for InfernoTask {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[
+            InfernoTask::Writing,
+            InfernoTask::Code,
+            InfernoTask::Research,
+            InfernoTask::Analysis,
+            InfernoTask::Prompt,
+        ]
+    }
+
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(clap::builder::PossibleValue::new(match self {
+            InfernoTask::Writing => "writing",
+            InfernoTask::Code => "code",
+            InfernoTask::Research => "research",
+            InfernoTask::Analysis => "analysis",
+            InfernoTask::Prompt => "prompt",
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CLI args (clap derive)
 // ---------------------------------------------------------------------------
 
-/// Agentic Inferno — a spectacle tool for watching LLMs tear each other apart.
+/// Agentic Inferno — watch a Writer LLM revise a document while a Critic LLM heckles it.
 #[derive(Parser, Debug)]
 #[command(name = "agentic-inferno", version, about)]
 pub struct CliArgs {
@@ -102,9 +160,19 @@ pub struct CliArgs {
     #[arg(long = "critic-model")]
     pub critic_model: Option<String>,
 
-    /// Input file or directory path for the writer to work on (required).
-    #[arg(long = "input", required = true, value_hint = clap::ValueHint::FilePath)]
-    pub input: PathBuf,
+    /// Input file or directory path for the writer to work on.
+    ///
+    /// Required for every task except `prompt`; ignored in prompt mode.
+    #[arg(long = "input", required = false, value_hint = clap::ValueHint::FilePath)]
+    pub input: Option<PathBuf>,
+
+    /// What kind of work the writer agent attempts (default: writing).
+    #[arg(long = "task")]
+    pub task: Option<InfernoTask>,
+
+    /// A free-form prompt for the writer to attempt forever (implies --task prompt).
+    #[arg(long = "prompt")]
+    pub prompt: Option<String>,
 
     /// Maximum total cost in USD before stopping (default: 2.0).
     #[arg(long = "max-cost-usd")]
@@ -169,7 +237,10 @@ impl TomlConfig {
     pub fn from_file(path: &std::path::Path) -> Result<Self, AppError> {
         let contents = std::fs::read_to_string(path)?;
         toml::from_str(&contents).map_err(|e| {
-            AppError::Validation(format!("Failed to parse config file '{}': {e}", path.display()))
+            AppError::Validation(format!(
+                "Failed to parse config file '{}': {e}",
+                path.display()
+            ))
         })
     }
 }
@@ -187,7 +258,14 @@ pub struct Config {
     pub critic_model: String,
     /// Critic personality style.
     pub critic_style: CriticStyle,
+    /// The kind of work the writer agent attempts.
+    pub task: InfernoTask,
+    /// Free-form prompt for `InfernoTask::Prompt` mode (None otherwise).
+    pub prompt: Option<String>,
     /// Canonicalised input file path (exists after build).
+    ///
+    /// In `InfernoTask::Prompt` mode no input file is used and this stays
+    /// empty (`PathBuf::new()`).
     pub input: PathBuf,
     /// Maximum total cost in USD.
     pub max_cost_usd: f64,
@@ -211,10 +289,12 @@ impl Config {
     /// Default values used when nothing else provides a value.
     fn defaults() -> Self {
         Self {
-            writer_model: String::new(),    // required from CLI
+            writer_model: String::new(), // required from CLI
             critic_model: "deepseek-chat".into(),
             critic_style: CriticStyle::Random,
-            input: PathBuf::new(),          // required from CLI
+            task: InfernoTask::Writing,
+            prompt: None,
+            input: PathBuf::new(), // required from CLI (except prompt mode)
             max_cost_usd: 2.0,
             temperature: 0.8,
             max_tokens: 8192,
@@ -286,9 +366,23 @@ impl Config {
         }
 
         // --- Layer 4: CLI overrides everything ---
-        // writer_model and input are required by clap — always present.
+        // writer_model is required by clap — always present.
         config.writer_model = cli.writer_model;
-        config.input = cli.input;
+
+        // Resolve the task. Supplying --prompt implies --task prompt unless an
+        // explicit --task was given (the explicit flag wins).
+        config.task = cli.task.unwrap_or(if cli.prompt.is_some() {
+            InfernoTask::Prompt
+        } else {
+            InfernoTask::Writing
+        });
+        config.prompt = cli.prompt;
+
+        // --input is conditionally required (enforced in validate()). Only
+        // carry it over when actually supplied.
+        if let Some(input) = cli.input {
+            config.input = input;
+        }
         if let Some(v) = cli.critic_model {
             config.critic_model = v;
         }
@@ -337,10 +431,14 @@ impl Config {
             ));
         }
         if self.max_tokens == 0 {
-            return Err(AppError::Validation("max-tokens must be greater than 0".into()));
+            return Err(AppError::Validation(
+                "max-tokens must be greater than 0".into(),
+            ));
         }
         if self.timeout_secs == 0 {
-            return Err(AppError::Validation("timeout-secs must be greater than 0".into()));
+            return Err(AppError::Validation(
+                "timeout-secs must be greater than 0".into(),
+            ));
         }
 
         // Detect providers for both models
@@ -364,9 +462,30 @@ impl Config {
             return Err(AppError::ClaudeNotFound);
         }
 
-        // Leak guard — canonicalise input, verify it's either outside repo
-        // or inside repo/inputs/.
-        self.apply_leak_guard()?;
+        // Input requirements depend on the task.
+        if self.task == InfernoTask::Prompt {
+            // Prompt mode: --prompt is required; --input is ignored, so the
+            // leak guard and canonicalisation are skipped entirely.
+            let has_prompt = self
+                .prompt
+                .as_deref()
+                .map(|p| !p.trim().is_empty())
+                .unwrap_or(false);
+            if !has_prompt {
+                return Err(AppError::Validation(
+                    "--prompt <text> is required when --task is 'prompt' (or when relying on --prompt to select the task)".into(),
+                ));
+            }
+        } else {
+            // Non-prompt tasks: --input is required. An empty path means it was
+            // never supplied (clap no longer enforces it).
+            if self.input.as_os_str().is_empty() {
+                return Err(AppError::MissingInput);
+            }
+            // Leak guard — canonicalise input, verify it's either outside repo
+            // or inside repo/inputs/.
+            self.apply_leak_guard()?;
+        }
 
         Ok(())
     }
@@ -426,8 +545,11 @@ fn find_repo_root(start: &std::path::Path) -> Option<PathBuf> {
 }
 
 /// Check whether the `claude` CLI binary is available on PATH.
+///
+/// Uses [`resolve_claude_bin`] so the lookup honors the Windows `.cmd`/`.exe`
+/// shim names that Rust's `Command` does not resolve via `PATHEXT`.
 fn claude_cli_on_path() -> bool {
-    std::process::Command::new("claude")
+    std::process::Command::new(resolve_claude_bin())
         .arg("--version")
         .output()
         .map(|o| o.status.success())
@@ -442,13 +564,21 @@ fn claude_cli_on_path() -> bool {
 mod tests {
     use super::*;
     use clap::ValueEnum;
+    use std::sync::Mutex;
+
+    /// Serialise the env-var set/remove window inside `build_test_config` so
+    /// parallel tests don't clobber each other's `DEEPSEEK_API_KEY`.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     // -- CriticStyle --
 
     #[test]
     fn test_critic_style_display() {
         assert_eq!(CriticStyle::Aggressive.to_string(), "aggressive");
-        assert_eq!(CriticStyle::PassiveAggressive.to_string(), "passive-aggressive");
+        assert_eq!(
+            CriticStyle::PassiveAggressive.to_string(),
+            "passive-aggressive"
+        );
         assert_eq!(CriticStyle::Theatrical.to_string(), "theatrical");
         assert_eq!(CriticStyle::AcademicSnob.to_string(), "academic-snob");
         assert_eq!(CriticStyle::Disappointed.to_string(), "disappointed");
@@ -457,7 +587,10 @@ mod tests {
 
     #[test]
     fn test_critic_style_from_str() {
-        assert_eq!("aggressive".parse::<CriticStyle>().unwrap(), CriticStyle::Aggressive);
+        assert_eq!(
+            "aggressive".parse::<CriticStyle>().unwrap(),
+            CriticStyle::Aggressive
+        );
         assert_eq!(
             "passive-aggressive".parse::<CriticStyle>().unwrap(),
             CriticStyle::PassiveAggressive
@@ -466,10 +599,22 @@ mod tests {
             "PassiveAggressive".parse::<CriticStyle>().unwrap(),
             CriticStyle::PassiveAggressive
         );
-        assert_eq!("theatrical".parse::<CriticStyle>().unwrap(), CriticStyle::Theatrical);
-        assert_eq!("academic-snob".parse::<CriticStyle>().unwrap(), CriticStyle::AcademicSnob);
-        assert_eq!("disappointed".parse::<CriticStyle>().unwrap(), CriticStyle::Disappointed);
-        assert_eq!("random".parse::<CriticStyle>().unwrap(), CriticStyle::Random);
+        assert_eq!(
+            "theatrical".parse::<CriticStyle>().unwrap(),
+            CriticStyle::Theatrical
+        );
+        assert_eq!(
+            "academic-snob".parse::<CriticStyle>().unwrap(),
+            CriticStyle::AcademicSnob
+        );
+        assert_eq!(
+            "disappointed".parse::<CriticStyle>().unwrap(),
+            CriticStyle::Disappointed
+        );
+        assert_eq!(
+            "random".parse::<CriticStyle>().unwrap(),
+            CriticStyle::Random
+        );
     }
 
     #[test]
@@ -483,6 +628,44 @@ mod tests {
         assert_eq!(variants.len(), 6);
         assert!(variants.contains(&CriticStyle::Aggressive));
         assert!(variants.contains(&CriticStyle::Random));
+    }
+
+    // -- InfernoTask --
+
+    #[test]
+    fn test_inferno_task_default_is_writing() {
+        assert_eq!(InfernoTask::default(), InfernoTask::Writing);
+    }
+
+    #[test]
+    fn test_inferno_task_display() {
+        assert_eq!(InfernoTask::Writing.to_string(), "writing");
+        assert_eq!(InfernoTask::Code.to_string(), "code");
+        assert_eq!(InfernoTask::Research.to_string(), "research");
+        assert_eq!(InfernoTask::Analysis.to_string(), "analysis");
+        assert_eq!(InfernoTask::Prompt.to_string(), "prompt");
+    }
+
+    #[test]
+    fn test_inferno_task_value_variants() {
+        let variants = InfernoTask::value_variants();
+        assert_eq!(variants.len(), 5);
+        assert!(variants.contains(&InfernoTask::Writing));
+        assert!(variants.contains(&InfernoTask::Prompt));
+    }
+
+    #[test]
+    fn test_inferno_task_value_enum_each_variant_parses() {
+        for (name, expected) in [
+            ("writing", InfernoTask::Writing),
+            ("code", InfernoTask::Code),
+            ("research", InfernoTask::Research),
+            ("analysis", InfernoTask::Analysis),
+            ("prompt", InfernoTask::Prompt),
+        ] {
+            let parsed = InfernoTask::from_str(name, true).expect("variant should parse");
+            assert_eq!(parsed, expected, "{name} should parse to {expected:?}");
+        }
     }
 
     // -- TomlConfig --
@@ -557,6 +740,75 @@ openai_base_url = "https://custom.openai.com"
         assert!(cfg.is_err());
     }
 
+    // -- Task / prompt mode build behaviour --
+
+    #[test]
+    fn test_build_default_task_is_writing() {
+        let cfg = build_test_config(|_| {}).expect("build should succeed");
+        assert_eq!(cfg.task, InfernoTask::Writing);
+        assert!(cfg.prompt.is_none());
+    }
+
+    #[test]
+    fn test_build_explicit_task_analysis() {
+        let cfg = build_test_config(|c| c.task = Some(InfernoTask::Analysis))
+            .expect("build should succeed");
+        assert_eq!(cfg.task, InfernoTask::Analysis);
+    }
+
+    #[test]
+    fn test_build_prompt_implies_prompt_task_without_input() {
+        // No --input, no --task, just --prompt: should select Prompt task and
+        // build successfully despite the missing input file.
+        let cfg = build_test_config(|c| {
+            c.input = None;
+            c.prompt = Some("prove that 1 equals 2".into());
+        })
+        .expect("prompt mode should build without --input");
+        assert_eq!(cfg.task, InfernoTask::Prompt);
+        assert_eq!(cfg.prompt.as_deref(), Some("prove that 1 equals 2"));
+    }
+
+    #[test]
+    fn test_build_explicit_task_wins_over_prompt_implication() {
+        // Explicit --task code with a --prompt present: explicit task wins.
+        let cfg = build_test_config(|c| {
+            c.task = Some(InfernoTask::Code);
+            c.prompt = Some("ignored implication".into());
+        })
+        .expect("build should succeed (input still present)");
+        assert_eq!(cfg.task, InfernoTask::Code);
+    }
+
+    #[test]
+    fn test_build_prompt_task_without_prompt_text_errors() {
+        let err = build_test_config(|c| {
+            c.input = None;
+            c.task = Some(InfernoTask::Prompt);
+            c.prompt = None;
+        })
+        .unwrap_err();
+        assert!(matches!(&err, AppError::Validation(_)), "got {err:?}");
+        assert!(err.to_string().contains("--prompt"), "error: {err}");
+    }
+
+    #[test]
+    fn test_build_non_prompt_task_without_input_errors() {
+        let err = build_test_config(|c| {
+            c.input = None;
+            c.task = Some(InfernoTask::Analysis);
+        })
+        .unwrap_err();
+        assert!(matches!(&err, AppError::MissingInput), "got {err:?}");
+    }
+
+    #[test]
+    fn test_build_default_task_without_input_errors() {
+        // Default (Writing) task with no input and no prompt must require input.
+        let err = build_test_config(|c| c.input = None).unwrap_err();
+        assert!(matches!(&err, AppError::MissingInput), "got {err:?}");
+    }
+
     #[test]
     fn test_find_repo_root() {
         // The test is running inside the project — should find it.
@@ -574,6 +826,11 @@ openai_base_url = "https://custom.openai.com"
     where
         F: FnOnce(&mut CliArgs),
     {
+        // Hold the lock across the whole set→build→remove window so parallel
+        // tests can't remove the key mid-validation. Recover from poisoning so
+        // a panic in one test doesn't cascade into spurious failures elsewhere.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         let tmp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
         let input_path = tmp_dir.path().join("test-input.txt");
         std::fs::write(&input_path, "test content").expect("failed to write test input");
@@ -585,7 +842,9 @@ openai_base_url = "https://custom.openai.com"
         let mut cli = CliArgs {
             writer_model: "deepseek-reasoner".into(),
             critic_model: Some("deepseek-chat".into()),
-            input: input_path,
+            input: Some(input_path),
+            task: None,
+            prompt: None,
             max_cost_usd: Some(1.0),
             temperature: Some(0.8),
             max_tokens: Some(1024),

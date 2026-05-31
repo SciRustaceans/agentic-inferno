@@ -54,6 +54,18 @@ pub enum AppEvent {
         apology_cost: f64,
     },
 
+    /// Cumulative token usage across the run.
+    ///
+    /// Each field is the current running total for that agent; `total` is the
+    /// sum. Every emit carries the true cumulative value of all three counters
+    /// (read from a shared accumulator), so the meter never flickers.
+    TokenUsage {
+        writer: u64,
+        critic: u64,
+        apology: u64,
+        total: u64,
+    },
+
     /// The loop detection guard triggered — the output is repetitive and no
     /// further progress is expected.
     LoopExhausted,

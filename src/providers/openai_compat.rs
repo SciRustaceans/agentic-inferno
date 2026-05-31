@@ -124,9 +124,13 @@ async fn parse_success_response(response: reqwest::Response) -> Result<ChatReply
         .and_then(|v| v.as_f64())
         .filter(|c| !c.is_nan());
 
+    // Extract total token usage if the provider reported it.
+    let tokens = full_body["usage"]["total_tokens"].as_u64();
+
     Ok(ChatReply {
         text: content,
         cost_usd,
+        tokens,
     })
 }
 
@@ -172,6 +176,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parse_success_with_usage_tokens() {
+        let resp = fake_response(json!({
+            "choices": [{"message": {"content": "Hi"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+        }));
+        let reply = parse_success_response(resp).await.unwrap();
+        assert_eq!(reply.text, "Hi");
+        assert_eq!(reply.tokens, Some(15));
+    }
+
+    #[tokio::test]
+    async fn parse_success_absent_usage_tokens_is_none() {
+        let resp = fake_response(json!({
+            "choices": [{"message": {"content": "Hi"}}],
+        }));
+        let reply = parse_success_response(resp).await.unwrap();
+        assert!(reply.tokens.is_none());
+    }
+
+    #[tokio::test]
     async fn parse_nan_cost_becomes_none() {
         let resp = fake_response(json!({
             "choices": [{"message": {"content": "Hi"}}],
@@ -179,7 +203,10 @@ mod tests {
         }));
         let reply = parse_success_response(resp).await.unwrap();
         assert_eq!(reply.text, "Hi");
-        assert!(reply.cost_usd.is_none(), "NaN cost must be filtered to None");
+        assert!(
+            reply.cost_usd.is_none(),
+            "NaN cost must be filtered to None"
+        );
     }
 
     #[tokio::test]

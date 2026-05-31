@@ -229,7 +229,11 @@ fn test_routing_table() {
 fn test_opus_is_anthropic_in_table() {
     // Redundant with table but explicit assertion per task requirement.
     let (provider, _) = detect_provider("opus", "Writer").unwrap();
-    assert_eq!(provider, Provider::Anthropic, "'opus' must be Anthropic, not OpenAI");
+    assert_eq!(
+        provider,
+        Provider::Anthropic,
+        "'opus' must be Anthropic, not OpenAI"
+    );
 }
 
 #[test]
@@ -243,6 +247,9 @@ fn test_o1_mini_is_openai() {
 fn test_unknown_model_includes_agent_in_error() {
     let err = detect_provider("no-such-model", "Critic").unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("no-such-model"), "error must include model name");
+    assert!(
+        msg.contains("no-such-model"),
+        "error must include model name"
+    );
     assert!(msg.contains("Critic"), "error must include agent name");
 }

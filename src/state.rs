@@ -274,7 +274,8 @@ mod tests {
         let writer = state.clone();
 
         let reader_handle = std::thread::spawn(move || reader.snapshot());
-        let writer_handle = std::thread::spawn(move || writer.update("written concurrently".to_string()));
+        let writer_handle =
+            std::thread::spawn(move || writer.update("written concurrently".to_string()));
 
         let (ver, _content) = reader_handle.join().expect("reader panicked");
         let new_ver = writer_handle.join().expect("writer panicked");

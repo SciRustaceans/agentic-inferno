@@ -21,10 +21,7 @@ fn test_all_four_variants_exist_compile_time_check() {
     ];
     for state in &states {
         match state {
-            AppState::Idle
-            | AppState::Running
-            | AppState::Stopping
-            | AppState::Done => {}
+            AppState::Idle | AppState::Running | AppState::Stopping | AppState::Done => {}
         }
     }
     assert_eq!(states.len(), 4);
@@ -149,6 +146,8 @@ fn test_config_has_no_max_iterations_field() {
         writer_model: String::new(),
         critic_model: "deepseek-chat".into(),
         critic_style: CriticStyle::Random,
+        task: agentic_inferno::config::InfernoTask::Writing,
+        prompt: None,
         input: PathBuf::new(),
         max_cost_usd: 2.0,
         temperature: 0.8,
@@ -181,7 +180,9 @@ fn test_invalid_config_validation_rejected() {
     let cli = CliArgs {
         writer_model: "deepseek-reasoner".into(),
         critic_model: Some("deepseek-chat".into()),
-        input: std::path::PathBuf::from("/nonexistent/path"),
+        input: Some(std::path::PathBuf::from("/nonexistent/path")),
+        task: None,
+        prompt: None,
         max_cost_usd: Some(0.0),
         temperature: Some(0.8),
         max_tokens: Some(1024),
@@ -206,7 +207,9 @@ fn test_invalid_temperature_rejected() {
     let cli = CliArgs {
         writer_model: "deepseek-reasoner".into(),
         critic_model: Some("deepseek-chat".into()),
-        input: std::path::PathBuf::from("/nonexistent/path"),
+        input: Some(std::path::PathBuf::from("/nonexistent/path")),
+        task: None,
+        prompt: None,
         max_cost_usd: Some(1.0),
         temperature: Some(99.9),
         max_tokens: Some(1024),

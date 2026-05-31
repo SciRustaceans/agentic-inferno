@@ -81,9 +81,7 @@ pub fn detect_provider(model: &str, agent_name: &str) -> Result<(Provider, Strin
 
     // --- OpenAI patterns: `gpt-*` or `o` followed by a digit ---
     if lowered.starts_with("gpt-")
-        || (lowered.starts_with('o')
-            && lowered.len() > 1
-            && lowered.as_bytes()[1].is_ascii_digit())
+        || (lowered.starts_with('o') && lowered.len() > 1 && lowered.as_bytes()[1].is_ascii_digit())
     {
         return Ok((Provider::OpenAi, lowered));
     }
@@ -105,6 +103,40 @@ pub fn detect_provider(model: &str, agent_name: &str) -> Result<(Provider, Strin
     ))
 }
 
+/// Resolve the name used to invoke the `claude` CLI binary.
+///
+/// On Windows, Rust's `std::process::Command` does not consult `PATHEXT`, so
+/// `Command::new("claude")` fails to find a `claude.cmd` shim (the form the
+/// official installer drops on PATH). This probes the likely candidates and
+/// returns the first whose `--version` invocation succeeds. If none succeed
+/// (e.g. the CLI is not installed), it falls back to `"claude.cmd"`, which is
+/// the most common form, so the eventual spawn produces a clear error rather
+/// than silently using the wrong name.
+///
+/// On Unix the binary is simply `claude`.
+#[cfg(windows)]
+pub fn resolve_claude_bin() -> String {
+    for cand in ["claude.cmd", "claude.exe", "claude"] {
+        let ok = std::process::Command::new(cand)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            return cand.to_string();
+        }
+    }
+    "claude.cmd".to_string()
+}
+
+/// Resolve the name used to invoke the `claude` CLI binary (Unix).
+///
+/// See the Windows variant for why this exists; on Unix the name is `claude`.
+#[cfg(not(windows))]
+pub fn resolve_claude_bin() -> String {
+    "claude".to_string()
+}
+
 /// A request to chat with an LLM provider.
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
@@ -120,6 +152,10 @@ pub struct ChatRequest {
 pub struct ChatReply {
     pub text: String,
     pub cost_usd: Option<f64>,
+    /// Total tokens reported for the call (prompt + completion), if the
+    /// provider's response carried usage data. `None` when the API omits
+    /// usage, in which case the orchestrator estimates from the text.
+    pub tokens: Option<u64>,
 }
 
 /// Represents a client connected to a specific LLM provider.
@@ -139,10 +175,7 @@ pub enum LlmClient {
         http: reqwest::Client,
     },
     /// Local `claude` CLI binary client.
-    AnthropicCli {
-        model: String,
-        claude_bin: String,
-    },
+    AnthropicCli { model: String, claude_bin: String },
 }
 
 impl LlmClient {
@@ -305,5 +338,24 @@ mod tests {
             claude_bin: "claude".into(),
         };
         assert_eq!(client.provider_name(), "Anthropic CLI");
+    }
+
+    // ── resolve_claude_bin ─────────────────────────────────────
+
+    #[test]
+    fn test_resolve_claude_bin_non_empty_and_no_panic() {
+        // Must never panic, even when the CLI is absent, and must return a
+        // non-empty, platform-appropriate name.
+        let bin = resolve_claude_bin();
+        assert!(!bin.is_empty());
+
+        #[cfg(not(windows))]
+        assert_eq!(bin, "claude");
+
+        #[cfg(windows)]
+        assert!(
+            bin == "claude.cmd" || bin == "claude.exe" || bin == "claude",
+            "unexpected Windows claude binary name: {bin}"
+        );
     }
 }

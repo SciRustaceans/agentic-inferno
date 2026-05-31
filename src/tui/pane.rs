@@ -76,7 +76,12 @@ impl PaneBuffer {
 
         // scroll_position=0 shows last `height` lines.
         // scroll_position increases → look further up the buffer.
-        let start = total.saturating_sub(height + self.scroll_position);
+        // Two-step saturating subtraction so `scroll_to_top`'s
+        // `scroll_position == usize::MAX` clamps `start` to 0 instead of
+        // overflowing `height + scroll_position`.
+        let start = total
+            .saturating_sub(height)
+            .saturating_sub(self.scroll_position);
         let end = (start + height).min(total);
 
         self.lines.range(start..end).map(String::as_str).collect()
@@ -121,7 +126,11 @@ impl PaneBuffer {
     ///
     /// Does **not** include a trailing newline.
     pub fn content(&self) -> String {
-        self.lines.iter().map(String::as_str).collect::<Vec<_>>().join("\n")
+        self.lines
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     // ── Accessors (for testing / inspection) ──────────────────────
@@ -277,6 +286,22 @@ mod tests {
         buf.scroll_up(50);
         let visible = buf.visible_lines(10);
         // Clamped to show first 10 lines
+        assert_eq!(visible.len(), 10);
+        assert_eq!(visible[0], "line_00");
+        assert_eq!(visible[9], "line_09");
+    }
+
+    #[test]
+    fn test_visible_lines_after_scroll_to_top_no_overflow() {
+        // Regression: scroll_to_top() sets scroll_position = usize::MAX.
+        // visible_lines must clamp start to 0 (show the top slice) instead of
+        // overflowing `height + scroll_position`.
+        let mut buf = PaneBuffer::with_max_lines(100);
+        for i in 0..50 {
+            buf.push(&format!("line_{i:02}"));
+        }
+        buf.scroll_to_top();
+        let visible = buf.visible_lines(10);
         assert_eq!(visible.len(), 10);
         assert_eq!(visible[0], "line_00");
         assert_eq!(visible[9], "line_09");

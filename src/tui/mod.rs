@@ -102,24 +102,33 @@ impl Tui {
 
     /// Main event loop — owns rendering, never blocks on LLM work.
     ///
-    /// Three `tokio::select!` branches:
+    /// Four `tokio::select!` branches:
     ///
     /// | Branch | Source | Purpose |
     /// |--------|--------|---------|
     /// | 1 | `event_rx.recv()` | Process events from spawned LLM tasks |
     /// | 2 | `reader.next()` | Handle user key presses |
     /// | 3 | `cancel_token.cancelled()` | Exit after draining |
+    /// | 4 | `interval.tick()` | Advance the banner animation frame |
+    ///
+    /// `task` is the active inferno task label, shown in the banner.
     ///
     /// The loop runs until `event_rx` is closed (all senders dropped) or
     /// the state transitions to `Done`.
     pub async fn run(
         &mut self,
         mut event_rx: UnboundedReceiver<AppEvent>,
+        task: String,
     ) -> Result<(), AppError> {
         let mut reader = EventStream::new();
         let mut app = ui::App::new();
         app.state = AppState::Running;
+        app.task = task;
         self.state = AppState::Running;
+
+        // ~8 fps animation tick driving the flame title. The frame counter,
+        // not wall-clock, drives the animation so it stays deterministic.
+        let mut anim_interval = tokio::time::interval(Duration::from_millis(120));
 
         loop {
             tokio::select! {
@@ -160,6 +169,11 @@ impl Tui {
                     if self.stopping_since.is_none() {
                         self.stopping_since = Some(Instant::now());
                     }
+                }
+                _ = anim_interval.tick() => {
+                    // Advance the flame animation; the draw at the bottom of
+                    // the loop re-renders so the gradient ripples sideways.
+                    app.frame = app.frame.wrapping_add(1);
                 }
             }
 
@@ -215,16 +229,10 @@ impl Tui {
 fn handle_app_event(app: &mut ui::App, event: AppEvent) {
     match event {
         AppEvent::WriterOutput(chunk) => {
-            if let Ok(mut buf) = app.writer_buffer.write() {
-                buf.push(&chunk);
-                buf.scroll_to_bottom();
-            }
+            app.apply_writer_output(&chunk);
         }
         AppEvent::CriticOutput(chunk) => {
-            if let Ok(mut buf) = app.critic_buffer.write() {
-                buf.push(&chunk);
-                buf.scroll_to_bottom();
-            }
+            app.apply_critic_output(&chunk);
         }
         AppEvent::ApologyReady(text) => {
             app.apology_text = Some(text);
@@ -251,6 +259,17 @@ fn handle_app_event(app: &mut ui::App, event: AppEvent) {
             app.writer_cost = writer_cost;
             app.critic_cost = critic_cost;
             app.apology_cost = apology_cost;
+        }
+        AppEvent::TokenUsage {
+            writer,
+            critic,
+            apology,
+            total,
+        } => {
+            app.writer_tokens = writer;
+            app.critic_tokens = critic;
+            app.apology_tokens = apology;
+            app.total_tokens = total;
         }
         AppEvent::LoopExhausted => {
             app.state = AppState::Done;

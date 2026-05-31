@@ -18,14 +18,18 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 fn setup_deepseek(tmp: &tempfile::TempDir) -> PathBuf {
     let input = tmp.path().join("input.txt");
     std::fs::write(&input, "test content").expect("write test input");
-    unsafe { std::env::set_var("DEEPSEEK_API_KEY", "sk-test-fake-key-for-testing"); }
+    unsafe {
+        std::env::set_var("DEEPSEEK_API_KEY", "sk-test-fake-key-for-testing");
+    }
     input
 }
 
 /// Remove an environment variable.
 /// Caller MUST hold ENV_LOCK.
 fn rm_env(key: &str) {
-    unsafe { std::env::remove_var(key); }
+    unsafe {
+        std::env::remove_var(key);
+    }
 }
 
 /// Standard test CliArgs using DeepSeek models only.
@@ -33,7 +37,9 @@ fn cli_deepseek(input: PathBuf) -> CliArgs {
     CliArgs {
         writer_model: "deepseek-reasoner".into(),
         critic_model: Some("deepseek-chat".into()),
-        input,
+        input: Some(input),
+        task: None,
+        prompt: None,
         max_cost_usd: Some(1.0),
         temperature: Some(0.8),
         max_tokens: Some(1024),
@@ -72,7 +78,9 @@ where
 
     let orig_cwd = std::env::current_dir().expect("get original cwd");
     std::env::set_current_dir(repo.path()).expect("set cwd to repo");
-    unsafe { std::env::set_var("DEEPSEEK_API_KEY", "sk-test-fake-key"); }
+    unsafe {
+        std::env::set_var("DEEPSEEK_API_KEY", "sk-test-fake-key");
+    }
 
     f(repo.path());
 
@@ -182,7 +190,9 @@ fn test_precedence_env_base_url_fills_gap() {
     let tmp = tempfile::TempDir::new().unwrap();
     let input = setup_deepseek(&tmp);
 
-    unsafe { std::env::set_var("OPENAI_BASE_URL", "https://env.openai.example.com"); }
+    unsafe {
+        std::env::set_var("OPENAI_BASE_URL", "https://env.openai.example.com");
+    }
 
     let cli = cli_deepseek(input);
     let cfg = Config::build(cli, None).expect("build should succeed");
@@ -192,7 +202,9 @@ fn test_precedence_env_base_url_fills_gap() {
         Some("https://env.openai.example.com")
     );
 
-    unsafe { std::env::remove_var("OPENAI_BASE_URL"); }
+    unsafe {
+        std::env::remove_var("OPENAI_BASE_URL");
+    }
     rm_env("DEEPSEEK_API_KEY");
 }
 
@@ -202,7 +214,9 @@ fn test_precedence_toml_over_env_for_base_url() {
     let tmp = tempfile::TempDir::new().unwrap();
     let input = setup_deepseek(&tmp);
 
-    unsafe { std::env::set_var("OPENAI_BASE_URL", "https://env.openai.example.com"); }
+    unsafe {
+        std::env::set_var("OPENAI_BASE_URL", "https://env.openai.example.com");
+    }
 
     let toml = TomlConfig {
         openai_base_url: Some("https://toml.openai.example.com".into()),
@@ -220,7 +234,9 @@ fn test_precedence_toml_over_env_for_base_url() {
         Some("https://toml.openai.example.com")
     );
 
-    unsafe { std::env::remove_var("OPENAI_BASE_URL"); }
+    unsafe {
+        std::env::remove_var("OPENAI_BASE_URL");
+    }
     rm_env("DEEPSEEK_API_KEY");
 }
 
@@ -377,7 +393,9 @@ fn test_missing_api_key_openai() {
     let mut cli = cli_deepseek(input);
     cli.writer_model = "gpt-4o".into();
     cli.critic_model = Some("deepseek-chat".into());
-    unsafe { std::env::set_var("DEEPSEEK_API_KEY", "sk-test-fake-key"); }
+    unsafe {
+        std::env::set_var("DEEPSEEK_API_KEY", "sk-test-fake-key");
+    }
 
     let err = Config::build(cli, None).unwrap_err();
     assert!(
@@ -408,7 +426,9 @@ fn test_missing_api_key_placeholder_rejected() {
         "expected MissingKey for placeholder key, got {err:?}"
     );
     rm_env("DEEPSEEK_API_KEY");
-    unsafe { std::env::remove_var("OPENAI_API_KEY"); }
+    unsafe {
+        std::env::remove_var("OPENAI_API_KEY");
+    }
 }
 
 // ===========================================================================
@@ -454,7 +474,9 @@ fn test_claude_not_found() {
     }
 
     rm_env("DEEPSEEK_API_KEY");
-    unsafe { std::env::remove_var("ANTHROPIC_API_KEY"); }
+    unsafe {
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
 }
 
 // ===========================================================================

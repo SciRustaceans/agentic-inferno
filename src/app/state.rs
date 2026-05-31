@@ -9,10 +9,10 @@
 /// ```
 ///
 /// The TUI renders differently based on the current state:
-/// - **Idle**: splash/loading screen before the spectacle begins.
+/// - **Idle**: splash/loading screen before the loop starts.
 /// - **Running**: live three-pane feed with streaming output.
 /// - **Stopping**: draining in-flight work before exiting.
-/// - **Done**: spectacle concluded (normal exit, guard trip, or user quit).
+/// - **Done**: the run has ended (normal exit, guard trip, or user quit).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppState {
     /// Initial state before the Writer-Critic loop starts.
@@ -25,6 +25,6 @@ pub enum AppState {
     /// LLM calls and pending events.
     Stopping,
 
-    /// Spectacle has concluded — normal exit, all guards triggered, or user quit.
+    /// The run has ended: normal exit, a guard triggered, or user quit.
     Done,
 }
