@@ -20,6 +20,23 @@ use crate::state::{ApologyCooldown, SharedState};
 /// Pause between Writer loop cycles to avoid tight spinning on the LLM API.
 const CYCLE_SLEEP_MS: u64 = 500;
 
+/// Extra dwell after a reply has finished typing out, in milliseconds, so the
+/// reader gets a beat to absorb the fully-revealed text before the next reply.
+const DWELL_MS: u64 = 800;
+
+/// How long an agent loop should wait before its next API call so the current
+/// reply has had time to fully type out in the TUI, plus a short dwell.
+///
+/// = `(text_chars / reveal_cps) seconds + DWELL_MS`, floored at
+/// [`CYCLE_SLEEP_MS`]. `reveal_cps` is clamped to at least 1 so a zero rate
+/// never divides by zero.
+///
+/// Pure function of its inputs — unit-tested.
+fn reveal_dwell_ms(text_chars: usize, reveal_cps: u32) -> u64 {
+    let type_ms = text_chars as u64 * 1000 / reveal_cps.max(1) as u64;
+    (type_ms + DWELL_MS).max(CYCLE_SLEEP_MS)
+}
+
 // ---------------------------------------------------------------------------
 // Context window helpers
 // ---------------------------------------------------------------------------
@@ -347,11 +364,17 @@ async fn writer_loop(
     let model_context_window = estimate_model_context_window(&config.writer_model);
     let writer_system_prompt = prompts::writer_system(config.task);
     let mut critique_history: VecDeque<(String, usize)> = VecDeque::new();
+    let reveal_cps = config.reveal_cps();
 
     loop {
         if cancel_token.is_cancelled() {
             break;
         }
+
+        // Char count of the most recent reply, used to pace the next cycle so
+        // the reply has time to type out in the TUI. 0 on error / first iter →
+        // the dwell floors at CYCLE_SLEEP_MS.
+        let mut last_reply_chars = 0usize;
 
         let (current_version, current_content) = state.snapshot();
 
@@ -434,6 +457,10 @@ async fn writer_loop(
                 // whole point). Compute before `reply.text` is moved.
                 let call_tokens = resolve_call_tokens(reply.tokens, user_est, &reply.text);
                 record_and_emit_tokens(&token_totals, &event_tx, 0, call_tokens);
+
+                // Capture the reply length (before `reply.text` is moved) so
+                // the cycle pause waits for it to finish typing out.
+                last_reply_chars = reply.text.chars().count();
 
                 if let Some(cost) = reply.cost_usd {
                     // Track per-agent cost (only on success).
@@ -611,7 +638,7 @@ async fn writer_loop(
             _ = cancel_token.cancelled() => {
                 break;
             }
-            _ = tokio::time::sleep(Duration::from_millis(CYCLE_SLEEP_MS)) => {}
+            _ = tokio::time::sleep(Duration::from_millis(reveal_dwell_ms(last_reply_chars, reveal_cps))) => {}
         }
     }
 }
@@ -649,10 +676,17 @@ async fn critic_loop(
     critic_cost: Arc<Mutex<f64>>,
     token_totals: Arc<Mutex<TokenTotals>>,
 ) {
+    let reveal_cps = config.reveal_cps();
+
     loop {
         if cancel_token.is_cancelled() {
             break;
         }
+
+        // Char count of the most recent reply, used to pace the next cycle so
+        // the critique has time to type out in the TUI. 0 on error / first
+        // iter → the dwell floors at CYCLE_SLEEP_MS.
+        let mut last_reply_chars = 0usize;
 
         let (doc_version, doc_content) = state.snapshot();
 
@@ -674,6 +708,10 @@ async fn critic_loop(
                 // Record token usage unconditionally (before `reply.text` moves).
                 let call_tokens = resolve_call_tokens(reply.tokens, user_est, &reply.text);
                 record_and_emit_tokens(&token_totals, &event_tx, 1, call_tokens);
+
+                // Capture the reply length (before `reply.text` is moved) so
+                // the cycle pause waits for it to finish typing out.
+                last_reply_chars = reply.text.chars().count();
 
                 if let Some(cost) = reply.cost_usd {
                     // Track per-agent cost (only on success).
@@ -733,7 +771,7 @@ async fn critic_loop(
             _ = cancel_token.cancelled() => {
                 break;
             }
-            _ = tokio::time::sleep(Duration::from_millis(CYCLE_SLEEP_MS)) => {}
+            _ = tokio::time::sleep(Duration::from_millis(reveal_dwell_ms(last_reply_chars, reveal_cps))) => {}
         }
     }
 }
@@ -860,6 +898,42 @@ pub fn count_harsh_keywords(text: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reveal_dwell_ms_grows_with_length() {
+        // Longer replies take longer to type out, so the dwell grows.
+        let short = reveal_dwell_ms(100, 40);
+        let long = reveal_dwell_ms(2000, 40);
+        assert!(long > short, "dwell must grow with reply length");
+        // 2000 chars / 40 cps = 50s = 50_000ms, + 800 dwell.
+        assert_eq!(long, 2000 * 1000 / 40 + DWELL_MS);
+    }
+
+    #[test]
+    fn reveal_dwell_ms_floors_at_cycle_sleep() {
+        // A zero-length reply still waits at least CYCLE_SLEEP_MS.
+        assert!(reveal_dwell_ms(0, 40) >= CYCLE_SLEEP_MS);
+        // And a faster speed never drops below the floor either.
+        assert!(reveal_dwell_ms(0, 80) >= CYCLE_SLEEP_MS);
+    }
+
+    #[test]
+    fn reveal_dwell_ms_handles_zero_cps_safely() {
+        // cps=0 must not divide by zero; clamps to 1 cps internally.
+        let v = reveal_dwell_ms(40, 0);
+        assert!(v >= CYCLE_SLEEP_MS);
+        // 40 chars / 1 cps = 40_000ms + DWELL_MS.
+        assert_eq!(v, 40 * 1000 + DWELL_MS);
+    }
+
+    #[test]
+    fn reveal_dwell_ms_faster_speed_is_shorter() {
+        // The same reply types out faster at a higher cps, so the dwell is
+        // shorter (down to the floor).
+        let slow = reveal_dwell_ms(4000, 20);
+        let fast = reveal_dwell_ms(4000, 80);
+        assert!(fast < slow, "higher cps should shorten the dwell");
+    }
 
     #[test]
     fn resolve_call_tokens_uses_provider_value_when_present() {

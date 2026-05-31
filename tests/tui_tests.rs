@@ -22,6 +22,7 @@ use agentic_inferno::tui::TerminalGuard;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
+use ratatui::style::Color;
 use ratatui::Terminal;
 
 // =============================================================================
@@ -577,7 +578,7 @@ fn test_render_critic_output_appears_in_right_pane() {
 }
 
 #[test]
-fn test_render_apology_text_appears_in_bottom_pane() {
+fn test_render_apology_text_appears_in_centered_popup() {
     let mut app = App::new();
     app.apology_text = Some("SORRY_I_EXIST_99999".to_string());
     let buffer = render_app(&app, 120, 40);
@@ -585,16 +586,41 @@ fn test_render_apology_text_appears_in_bottom_pane() {
 }
 
 #[test]
-fn test_render_apology_pane_shows_apology_title() {
+fn test_render_apology_popup_shows_apology_title() {
     let mut app = App::new();
     app.apology_text = Some("mea culpa".to_string());
     let buffer = render_app(&app, 120, 40);
     let text = buffer_text(&buffer);
     assert!(
         text.contains("Apology"),
-        "Apology pane must be titled 'Apology'"
+        "Apology popup must be titled 'Apology'"
     );
     assert!(text.contains("mea culpa"));
+}
+
+#[test]
+fn test_apology_ttl_decrements_and_clears_text() {
+    let mut app = App::new();
+    app.apology_text = Some("transient apology".to_string());
+    app.apology_ttl = 2;
+
+    app.tick_apology();
+    assert_eq!(app.apology_ttl, 1);
+    assert!(
+        app.apology_text.is_some(),
+        "apology stays while ttl remains"
+    );
+
+    app.tick_apology();
+    assert_eq!(app.apology_ttl, 0);
+    assert!(
+        app.apology_text.is_none(),
+        "apology cleared when ttl reaches 0"
+    );
+
+    // Further ticks are a no-op at ttl 0.
+    app.tick_apology();
+    assert_eq!(app.apology_ttl, 0);
 }
 
 #[test]
@@ -733,24 +759,21 @@ fn test_render_status_bar_shows_cost_info() {
 }
 
 #[test]
-fn test_render_status_bar_shows_per_agent_cost() {
+fn test_render_banner_shows_per_agent_tokens() {
+    // Per-agent detail moved out of the status bar into the banner's token
+    // meter. The slim status bar no longer carries per-agent figures.
     let mut app = App::new();
-    app.writer_cost = 0.5;
-    app.critic_cost = 0.3;
-    app.apology_cost = 0.1;
+    app.writer_tokens = 500;
+    app.critic_tokens = 300;
+    app.apology_tokens = 100;
+    app.total_tokens = 900;
     let buffer = render_app(&app, 120, 40);
     let text = buffer_text(&buffer);
+    assert!(text.contains("Writer 500"), "Writer tokens missing: {text}");
+    assert!(text.contains("Critic 300"), "Critic tokens missing: {text}");
     assert!(
-        text.contains("Writer: $0.5000"),
-        "Writer cost missing: {text}"
-    );
-    assert!(
-        text.contains("Critic: $0.3000"),
-        "Critic cost missing: {text}"
-    );
-    assert!(
-        text.contains("Apologies: $0.1000"),
-        "Apology cost missing: {text}"
+        text.contains("Apology 100"),
+        "Apology tokens missing: {text}"
     );
 }
 
@@ -805,14 +828,18 @@ fn test_render_error_takes_priority_over_apology() {
 // =============================================================================
 
 #[test]
-fn test_render_version_info_in_status_bar() {
+fn test_render_version_info_in_pane_titles() {
+    // Versions are no longer duplicated in the slim status bar — they live in
+    // the pane titles (bracketed form).
     let mut app = App::new();
+    app.writer_buffer.write().expect("lock").push("w");
+    app.critic_buffer.write().expect("lock").push("c");
     app.writer_version = 2;
     app.critic_version = 1;
     let buffer = render_app(&app, 120, 40);
     let text = buffer_text(&buffer);
-    assert!(text.contains("Writer v2"));
-    assert!(text.contains("Critic v1"));
+    assert!(text.contains("Writer [v2]"), "writer version title: {text}");
+    assert!(text.contains("Critic [v1]"), "critic version title: {text}");
 }
 
 // =============================================================================
@@ -1004,8 +1031,9 @@ fn test_render_scroll_changes_visible_lines() {
 
 #[test]
 fn test_apply_writer_output_replaces_previous_document() {
-    let app = App::new();
+    let mut app = App::new();
     app.apply_writer_output("docA l1\ndocA l2");
+    app.reveal_all();
     {
         let content = app.writer_buffer.read().expect("lock").content();
         assert!(
@@ -1014,6 +1042,7 @@ fn test_apply_writer_output_replaces_previous_document() {
         );
     }
     app.apply_writer_output("docB only");
+    app.reveal_all();
     let content = app.writer_buffer.read().expect("lock").content();
     assert!(
         content.contains("docB"),
@@ -1027,26 +1056,159 @@ fn test_apply_writer_output_replaces_previous_document() {
 
 #[test]
 fn test_apply_writer_output_splits_into_lines() {
-    let app = App::new();
+    let mut app = App::new();
     app.apply_writer_output("first\nsecond\nthird");
+    // Typing now reveals over time; reveal everything to inspect the full doc.
+    app.reveal_all();
     let buf = app.writer_buffer.read().expect("lock");
     // Each text line becomes its own buffer line so scroll moves by lines.
     assert_eq!(buf.len(), 3, "document should be split line-by-line");
-    // After a writer revision the viewport reads from the top.
+    // The rebuilt pane follows the typing, so the viewport sits at the bottom.
     assert_eq!(
         buf.scroll_position(),
-        usize::MAX,
-        "writer output scrolls to top"
+        0,
+        "writer reveal follows the typing to the bottom"
     );
 }
 
 #[test]
 fn test_apply_writer_output_empty_leaves_buffer_empty() {
-    let app = App::new();
+    let mut app = App::new();
     app.apply_writer_output("seed");
     app.apply_writer_output("");
+    app.reveal_all();
     let buf = app.writer_buffer.read().expect("lock");
     assert!(buf.is_empty(), "empty text should leave the buffer empty");
+}
+
+// =============================================================================
+// Typewriter reveal — panes type out over ticks
+// =============================================================================
+
+/// Join the writer buffer's lines back into a single string (matching how the
+/// reveal rebuild splits on `.lines()`).
+fn writer_content(app: &App) -> String {
+    app.writer_buffer.read().expect("lock").content()
+}
+
+/// Strip newlines so a partial reveal (whose trailing `\n` is dropped by
+/// `.lines()`) can be compared against the target prefix.
+fn no_newlines(s: &str) -> String {
+    s.chars().filter(|c| *c != '\n').collect()
+}
+
+#[test]
+fn test_writer_reveal_starts_empty_then_grows() {
+    let mut app = App::new();
+    app.reveal_step = 5;
+    app.apply_writer_output("line one\nline two\nline three");
+
+    // Before any tick, nothing is revealed — the buffer is empty.
+    assert!(
+        app.writer_buffer.read().expect("lock").is_empty(),
+        "writer pane should start empty (revealed=0)"
+    );
+    assert_eq!(app.writer_revealed, 0);
+
+    // Tick a few times; the visible content must grow monotonically.
+    let mut prev = no_newlines(&writer_content(&app)).len();
+    for _ in 0..4 {
+        app.tick_reveal();
+        let now = no_newlines(&writer_content(&app)).len();
+        assert!(
+            now >= prev,
+            "revealed content length must not shrink: {prev} -> {now}"
+        );
+        // Whatever is visible must be a prefix of the target (sans newlines).
+        let target_nl = no_newlines("line one\nline two\nline three");
+        let visible_nl = no_newlines(&writer_content(&app));
+        assert!(
+            target_nl.starts_with(&visible_nl),
+            "visible content must be a prefix of the target: {visible_nl:?}"
+        );
+        prev = now;
+    }
+}
+
+#[test]
+fn test_writer_reveal_completes_after_enough_ticks() {
+    let mut app = App::new();
+    app.reveal_step = 5;
+    let target = "line one\nline two\nline three";
+    app.apply_writer_output(target);
+
+    // Tick enough times to reveal everything (char count / step, plus slack).
+    let total = target.chars().count();
+    for _ in 0..(total / 5 + 2) {
+        app.tick_reveal();
+    }
+
+    assert_eq!(
+        app.writer_revealed, total,
+        "all characters should be revealed"
+    );
+    let expected = target.lines().collect::<Vec<_>>().join("\n");
+    assert_eq!(
+        writer_content(&app),
+        expected,
+        "fully revealed content must equal the target document"
+    );
+}
+
+#[test]
+fn test_reveal_all_shows_full_target_immediately() {
+    let mut app = App::new();
+    app.reveal_step = 1;
+    let target = "alpha\nbeta\ngamma";
+    app.apply_writer_output(target);
+    // Only one tick (1 char) — still mostly hidden.
+    app.tick_reveal();
+    assert!(app.writer_revealed < target.chars().count());
+
+    app.reveal_all();
+    assert_eq!(app.writer_revealed, target.chars().count());
+    let expected = target.lines().collect::<Vec<_>>().join("\n");
+    assert_eq!(writer_content(&app), expected);
+}
+
+#[test]
+fn test_tick_reveal_clamps_at_target_length() {
+    let mut app = App::new();
+    app.reveal_step = 100;
+    app.apply_writer_output("short");
+    app.tick_reveal();
+    assert_eq!(app.writer_revealed, "short".chars().count());
+    // Further ticks do not overshoot.
+    app.tick_reveal();
+    assert_eq!(app.writer_revealed, "short".chars().count());
+}
+
+#[test]
+fn test_critic_reveal_keeps_already_revealed_text() {
+    let mut app = App::new();
+    app.reveal_step = 1000; // reveal whole appends each tick
+    app.critic_version = 1;
+    app.apply_critic_output("first critique");
+    app.tick_reveal();
+    let after_first = app.critic_buffer.read().expect("lock").content();
+    assert!(
+        after_first.contains("first critique"),
+        "first critique should be revealed: {after_first}"
+    );
+
+    // A second append leaves the first shown and reveals the new tail.
+    app.critic_version = 2;
+    app.apply_critic_output("second critique");
+    app.tick_reveal();
+    let after_second = app.critic_buffer.read().expect("lock").content();
+    assert!(
+        after_second.contains("first critique"),
+        "earlier critique must stay shown: {after_second}"
+    );
+    assert!(
+        after_second.contains("second critique"),
+        "new critique should reveal: {after_second}"
+    );
 }
 
 // =============================================================================
@@ -1060,6 +1222,7 @@ fn test_apply_critic_output_feeds_with_version_headers() {
     app.apply_critic_output("crit one");
     app.critic_version = 2;
     app.apply_critic_output("crit two");
+    app.reveal_all();
 
     let content = app.critic_buffer.read().expect("lock").content();
     assert!(
@@ -1129,12 +1292,73 @@ fn test_flame_color_changes_as_frame_advances() {
 
 #[test]
 fn test_render_banner_shows_agent_inferno_title() {
+    // At a compact size (below the 100x30 big-banner threshold) the literal
+    // single-line flame title is rendered.
     let app = App::new();
-    let buffer = render_app(&app, 120, 40);
+    let buffer = render_app(&app, 90, 28);
     let text = buffer_text(&buffer);
     assert!(
         text.contains("AGENT INFERNO"),
-        "banner must show AGENT INFERNO title: {text}"
+        "compact banner must show literal AGENT INFERNO title: {text}"
+    );
+}
+
+#[test]
+fn test_render_big_banner_shows_block_title_rows() {
+    // At a wide size (>=100x30) the big ASCII-art banner renders. The block
+    // glyphs use the full-block char, so multiple non-empty title rows appear.
+    let app = App::new();
+    let buffer = render_app(&app, 120, 40);
+    let area = *buffer.area();
+    let mut block_rows = 0;
+    for y in 0..area.height {
+        let mut row = String::new();
+        for x in 0..area.width {
+            row.push_str(buffer.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
+        }
+        if row.contains('█') {
+            block_rows += 1;
+        }
+    }
+    assert!(
+        block_rows >= 5,
+        "big banner must render multiple non-empty block-art title rows, got {block_rows}"
+    );
+}
+
+#[test]
+fn test_render_big_banner_flames_animate_between_frames() {
+    // The big banner's flame rows and block title are colored via flame_color,
+    // which depends on `frame`. Comparing the full banner-area cell grid
+    // (symbol + fg) across two frames must show a difference.
+    let mut app = App::new();
+    app.frame = 0;
+    let buffer_a = render_app(&app, 120, 40);
+    app.frame = 7;
+    let buffer_b = render_app(&app, 120, 40);
+
+    // The big banner occupies the top 11 rows (Length(11)).
+    let area = *buffer_a.area();
+    let banner_h = 11.min(area.height);
+    let mut differs = false;
+    for y in 0..banner_h {
+        for x in 0..area.width {
+            let a = buffer_a.cell((x, y));
+            let b = buffer_b.cell((x, y));
+            let (sa, fa) = a.map(|c| (c.symbol(), c.fg)).unwrap_or((" ", Color::Reset));
+            let (sb, fb) = b.map(|c| (c.symbol(), c.fg)).unwrap_or((" ", Color::Reset));
+            if sa != sb || fa != fb {
+                differs = true;
+                break;
+            }
+        }
+        if differs {
+            break;
+        }
+    }
+    assert!(
+        differs,
+        "big banner must change (flames/title colors) between frame 0 and frame 7"
     );
 }
 
@@ -1174,12 +1398,13 @@ fn test_render_banner_shows_token_figure() {
 fn test_render_banner_animation_changes_title_styles() {
     // Render the title at two different frames; the text still reads
     // AGENT INFERNO but the per-cell foreground colors differ (the gradient
-    // ripples sideways).
+    // ripples sideways). Use the compact size so the literal single-line
+    // flame title (not the big block-art banner) is exercised.
     let mut app = App::new();
     app.frame = 0;
-    let buffer_a = render_app(&app, 120, 40);
+    let buffer_a = render_app(&app, 90, 28);
     app.frame = 1;
-    let buffer_b = render_app(&app, 120, 40);
+    let buffer_b = render_app(&app, 90, 28);
 
     assert!(buffer_text(&buffer_a).contains("AGENT INFERNO"));
     assert!(buffer_text(&buffer_b).contains("AGENT INFERNO"));

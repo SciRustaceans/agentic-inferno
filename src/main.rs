@@ -80,6 +80,9 @@ async fn run_spectacle_app(config: Config, initial_content: String) -> Result<()
     let state = SharedState::new(initial_content);
 
     let task_label = config.task.to_string();
+    // Typewriter step: chars revealed per ~8 fps animation tick. Derived from
+    // the configured reveal rate (cps / 8), floored at 1.
+    let reveal_step = (config.reveal_cps() as usize / 8).max(1);
 
     let spectacle_handle = tokio::spawn(orchestrator::run_spectacle(
         config.clone(),
@@ -90,7 +93,7 @@ async fn run_spectacle_app(config: Config, initial_content: String) -> Result<()
 
     install_panic_hook();
     let (mut tui, _guard) = Tui::enter(cancel_token.clone())?;
-    tui.run(event_rx, task_label).await?;
+    tui.run(event_rx, task_label, reveal_step).await?;
     Tui::exit()?;
 
     spectacle_handle

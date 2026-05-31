@@ -145,6 +145,7 @@ yourself.
 | `--max-tokens` | `8192` | Maximum tokens per model response. |
 | `--timeout-secs` | `120` | Request timeout in seconds. |
 | `--critic-style` | `random` | Critic personality. One of: `aggressive`, `passive-aggressive`, `theatrical`, `academic-snob`, `disappointed`, `random`. |
+| `--speed` | `normal` | Typewriter reveal speed for the panes. One of: `slow`, `normal`, `fast`. The agents pace themselves to the reveal so the next reply waits until the current one has typed out. |
 | `--config` | *(none)* | Path to a TOML config file (see [TOML config](#toml-config)). |
 | `--openai-base-url` | *(provider default)* | Override OpenAI API base URL. |
 | `--deepseek-base-url` | *(provider default)* | Override DeepSeek API base URL. |

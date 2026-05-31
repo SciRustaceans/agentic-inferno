@@ -112,6 +112,7 @@ impl Tui {
     /// | 4 | `interval.tick()` | Advance the banner animation frame |
     ///
     /// `task` is the active inferno task label, shown in the banner.
+    /// `reveal_step` is how many characters the panes type per animation tick.
     ///
     /// The loop runs until `event_rx` is closed (all senders dropped) or
     /// the state transitions to `Done`.
@@ -119,11 +120,13 @@ impl Tui {
         &mut self,
         mut event_rx: UnboundedReceiver<AppEvent>,
         task: String,
+        reveal_step: usize,
     ) -> Result<(), AppError> {
         let mut reader = EventStream::new();
         let mut app = ui::App::new();
         app.state = AppState::Running;
         app.task = task;
+        app.reveal_step = reveal_step.max(1);
         self.state = AppState::Running;
 
         // ~8 fps animation tick driving the flame title. The frame counter,
@@ -174,6 +177,11 @@ impl Tui {
                     // Advance the flame animation; the draw at the bottom of
                     // the loop re-renders so the gradient ripples sideways.
                     app.frame = app.frame.wrapping_add(1);
+                    // Advance the typewriter reveal so the panes type out at a
+                    // readable rate rather than appearing as instant blocks.
+                    app.tick_reveal();
+                    // Count down the apology popup's auto-dismiss timer.
+                    app.tick_apology();
                 }
             }
 
@@ -236,6 +244,8 @@ fn handle_app_event(app: &mut ui::App, event: AppEvent) {
         }
         AppEvent::ApologyReady(text) => {
             app.apology_text = Some(text);
+            // ~6s at the ~8 fps animation tick before the popup auto-dismisses.
+            app.apology_ttl = 50;
         }
         AppEvent::WriterDone(version) => {
             app.writer_version = version;

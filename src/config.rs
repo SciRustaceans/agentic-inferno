@@ -87,6 +87,62 @@ impl clap::ValueEnum for CriticStyle {
 }
 
 // ---------------------------------------------------------------------------
+// Speed
+// ---------------------------------------------------------------------------
+
+/// Typewriter reveal speed for the Writer/Critic panes.
+///
+/// Maps to a characters-per-second rate via [`Speed::cps`] that drives both the
+/// TUI reveal animation and how long each agent loop waits for its reply to
+/// finish typing out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Speed {
+    /// Slow reveal — 20 chars/sec.
+    Slow,
+    /// Normal reveal — 40 chars/sec. The default.
+    #[default]
+    Normal,
+    /// Fast reveal — 80 chars/sec.
+    Fast,
+}
+
+impl Speed {
+    /// Characters-per-second reveal rate for this speed.
+    pub fn cps(&self) -> u32 {
+        match self {
+            Speed::Slow => 20,
+            Speed::Normal => 40,
+            Speed::Fast => 80,
+        }
+    }
+}
+
+impl fmt::Display for Speed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Speed::Slow => write!(f, "slow"),
+            Speed::Normal => write!(f, "normal"),
+            Speed::Fast => write!(f, "fast"),
+        }
+    }
+}
+
+// clap::ValueEnum for CLI parsing — uses kebab-case (single-word) values.
+impl clap::ValueEnum for Speed {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[Speed::Slow, Speed::Normal, Speed::Fast]
+    }
+
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(clap::builder::PossibleValue::new(match self {
+            Speed::Slow => "slow",
+            Speed::Normal => "normal",
+            Speed::Fast => "fast",
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // InfernoTask
 // ---------------------------------------------------------------------------
 
@@ -198,6 +254,10 @@ pub struct CliArgs {
     #[arg(long = "critic-style")]
     pub critic_style: Option<CriticStyle>,
 
+    /// Typewriter reveal speed for the panes (default: normal).
+    #[arg(long = "speed")]
+    pub speed: Option<Speed>,
+
     /// OpenAI-compatible API base URL (overrides default).
     #[arg(long = "openai-base-url")]
     pub openai_base_url: Option<String>,
@@ -258,6 +318,8 @@ pub struct Config {
     pub critic_model: String,
     /// Critic personality style.
     pub critic_style: CriticStyle,
+    /// Typewriter reveal speed for the panes.
+    pub speed: Speed,
     /// The kind of work the writer agent attempts.
     pub task: InfernoTask,
     /// Free-form prompt for `InfernoTask::Prompt` mode (None otherwise).
@@ -292,6 +354,7 @@ impl Config {
             writer_model: String::new(), // required from CLI
             critic_model: "deepseek-chat".into(),
             critic_style: CriticStyle::Random,
+            speed: Speed::Normal,
             task: InfernoTask::Writing,
             prompt: None,
             input: PathBuf::new(), // required from CLI (except prompt mode)
@@ -304,6 +367,14 @@ impl Config {
             deepseek_base_url: None,
             moonshot_base_url: None,
         }
+    }
+
+    /// Characters-per-second reveal rate derived from the configured [`Speed`].
+    ///
+    /// Drives both the TUI typewriter animation and how long each agent loop
+    /// waits for its reply to finish typing out.
+    pub fn reveal_cps(&self) -> u32 {
+        self.speed.cps()
     }
 
     /// Build a validated `Config` using layered precedence:
@@ -388,6 +459,9 @@ impl Config {
         }
         if let Some(v) = cli.critic_style {
             config.critic_style = v;
+        }
+        if let Some(v) = cli.speed {
+            config.speed = v;
         }
         if let Some(v) = cli.max_cost_usd {
             config.max_cost_usd = v;
@@ -668,6 +742,105 @@ mod tests {
         }
     }
 
+    // -- Speed --
+
+    #[test]
+    fn test_speed_default_is_normal() {
+        assert_eq!(Speed::default(), Speed::Normal);
+    }
+
+    #[test]
+    fn test_speed_cps_mapping() {
+        assert_eq!(Speed::Slow.cps(), 20);
+        assert_eq!(Speed::Normal.cps(), 40);
+        assert_eq!(Speed::Fast.cps(), 80);
+    }
+
+    #[test]
+    fn test_speed_display() {
+        assert_eq!(Speed::Slow.to_string(), "slow");
+        assert_eq!(Speed::Normal.to_string(), "normal");
+        assert_eq!(Speed::Fast.to_string(), "fast");
+    }
+
+    #[test]
+    fn test_speed_value_variants() {
+        let variants = Speed::value_variants();
+        assert_eq!(variants.len(), 3);
+        assert!(variants.contains(&Speed::Slow));
+        assert!(variants.contains(&Speed::Normal));
+        assert!(variants.contains(&Speed::Fast));
+    }
+
+    #[test]
+    fn test_speed_value_enum_each_variant_parses() {
+        for (name, expected) in [
+            ("slow", Speed::Slow),
+            ("normal", Speed::Normal),
+            ("fast", Speed::Fast),
+        ] {
+            let parsed = Speed::from_str(name, true).expect("variant should parse");
+            assert_eq!(parsed, expected, "{name} should parse to {expected:?}");
+        }
+    }
+
+    #[test]
+    fn test_build_default_speed_is_normal() {
+        let cfg = build_test_config(|_| {}).expect("build should succeed");
+        assert_eq!(cfg.speed, Speed::Normal);
+        assert_eq!(cfg.reveal_cps(), 40);
+    }
+
+    #[test]
+    fn test_build_speed_override() {
+        let cfg = build_test_config(|c| c.speed = Some(Speed::Fast)).expect("build should succeed");
+        assert_eq!(cfg.speed, Speed::Fast);
+        assert_eq!(cfg.reveal_cps(), 80);
+    }
+
+    #[test]
+    fn test_cli_parses_each_speed_variant() {
+        use clap::Parser;
+        for (flag, expected) in [
+            ("slow", Speed::Slow),
+            ("normal", Speed::Normal),
+            ("fast", Speed::Fast),
+        ] {
+            let cli = CliArgs::try_parse_from([
+                "agentic-inferno",
+                "--writer-model",
+                "deepseek-reasoner",
+                "--speed",
+                flag,
+            ])
+            .expect("--speed should parse");
+            assert_eq!(cli.speed, Some(expected), "--speed {flag}");
+        }
+    }
+
+    #[test]
+    fn test_cli_speed_default_is_none_when_omitted() {
+        use clap::Parser;
+        let cli =
+            CliArgs::try_parse_from(["agentic-inferno", "--writer-model", "deepseek-reasoner"])
+                .expect("should parse without --speed");
+        // Omitted on the CLI → None; Config::build() then applies Speed::Normal.
+        assert_eq!(cli.speed, None);
+    }
+
+    #[test]
+    fn test_cli_rejects_invalid_speed() {
+        use clap::Parser;
+        let result = CliArgs::try_parse_from([
+            "agentic-inferno",
+            "--writer-model",
+            "deepseek-reasoner",
+            "--speed",
+            "ludicrous",
+        ]);
+        assert!(result.is_err(), "invalid --speed value should be rejected");
+    }
+
     // -- TomlConfig --
 
     #[test]
@@ -851,6 +1024,7 @@ openai_base_url = "https://custom.openai.com"
             timeout_secs: Some(30),
             config: None,
             critic_style: None,
+            speed: None,
             openai_base_url: None,
             deepseek_base_url: None,
             moonshot_base_url: None,

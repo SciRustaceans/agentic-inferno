@@ -46,6 +46,7 @@ fn cli_deepseek(input: PathBuf) -> CliArgs {
         timeout_secs: Some(30),
         config: None,
         critic_style: None,
+        speed: None,
         openai_base_url: None,
         deepseek_base_url: None,
         moonshot_base_url: None,
