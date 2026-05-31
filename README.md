@@ -14,13 +14,13 @@ never touched.
 
 ```bash
 # Build from source (only option for now)
-cargo install --git https://github.com/jojomatik/agentic-inferno
+cargo install --git https://github.com/SciRustaceans/agentic-inferno
 ```
 
 Or clone and build locally:
 
 ```bash
-git clone https://github.com/jojomatik/agentic-inferno
+git clone https://github.com/SciRustaceans/agentic-inferno
 cd agentic-inferno
 cargo build --release
 #./target/release/agentic-inferno --writer-model gpt-4o --input my-draft.md
@@ -77,7 +77,7 @@ will fetch a prebuilt binary (no Rust needed):
 
 ```powershell
 # Available once Windows release artifacts ship.
-powershell -c "irm https://github.com/jojomatik/agentic-inferno/releases/latest/download/agentic-inferno-installer.ps1 | iex"
+powershell -c "irm https://github.com/SciRustaceans/agentic-inferno/releases/latest/download/agentic-inferno-installer.ps1 | iex"
 ```
 
 That installer only fetches the binary — use `install.ps1` (or copy
