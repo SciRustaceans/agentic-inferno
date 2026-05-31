@@ -1,0 +1,10 @@
+/target
+.env
+.env.*
+.claude/
+.sisyphus/
+backups/
+Task_Rewrite.md*
+inputs/
+*.bak
+HANDOFF.md
