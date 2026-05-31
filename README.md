@@ -11,10 +11,7 @@ runs until you hit Esc or the cost ceiling is reached. Your original document is
 never touched.
 
 ## Screenshots
-
-The UI is the real `render()` — only the pane text is sample content. The images
-are generated with `cargo run --example screenshots` (no API calls), then
-rasterized from the SVGs in `docs/` with `rsvg-convert`.
+Examples of TUI in use.
 
 ![The spectacle: Writer and Critic panes with the animated AGENT INFERNO banner](docs/screenshot-main.png)
 
