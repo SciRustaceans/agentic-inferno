@@ -514,7 +514,12 @@ async fn test_writer_error_does_not_crash_critic() {
     let server = MockServer::start().await;
     let (_tmp, config) = build_test_config("Initial.", &server.uri());
 
-    // Writer mock: succeed on call 1, fail on call 2+
+    // Writer mock: interleave success (even call) and error (odd call). Each
+    // success returns *distinct* content so the document version advances (and
+    // the loop detector never fires), while the interspersed 400s exercise the
+    // "Writer errors don't crash the Critic" path. Distinct successes are
+    // required because the Critic is now gated on a fresh document version:
+    // a single advance would yield only one critique.
     let writer_counter = Arc::new(AtomicUsize::new(0));
     let wc = Arc::clone(&writer_counter);
     Mock::given(method("POST"))
@@ -522,9 +527,9 @@ async fn test_writer_error_does_not_crash_critic() {
         .and(body_string_contains("\"deepseek-reasoner\""))
         .respond_with(move |_: &wiremock::Request| {
             let n = wc.fetch_add(1, Ordering::SeqCst);
-            if n == 1 {
+            if n.is_multiple_of(2) {
                 ResponseTemplate::new(200).set_body_json(json!({
-                    "choices": [{"message": {"content": "Writer rev 1"}}],
+                    "choices": [{"message": {"content": format!("Writer rev {n}")}}],
                     "total_cost_usd": 0.001
                 }))
             } else {
@@ -599,6 +604,91 @@ async fn test_writer_error_does_not_crash_critic() {
         "Writer-error resilience: {writer_errors} writer errors, \
          {critic_outputs} critic outputs ({critic_calls} critic calls)"
     );
+}
+
+// =========================================================================
+// Test 5c — Critic waits: if the document never advances past the seed,
+//           the Critic emits no output (gate stays closed).
+// =========================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_critic_waits_when_writer_never_advances() {
+    let mut env = EnvGuard::new();
+    env.set("DEEPSEEK_API_KEY", "sk-test-mock-key-123456789");
+
+    let server = MockServer::start().await;
+    let (_tmp, config) = build_test_config("Initial.", &server.uri());
+
+    // Writer mock: always fails (400, no retry) → never advances the document
+    // version past the seed.
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("\"deepseek-reasoner\""))
+        .respond_with(ResponseTemplate::new(400).set_body_string("mock writer error"))
+        .mount(&server)
+        .await;
+
+    // Critic mock: always succeeds — so any Critic output would come from the
+    // gate opening, not from an absent/failing Critic. This proves the gate is
+    // what suppresses output, not a broken Critic.
+    let critic_counter = Arc::new(AtomicUsize::new(0));
+    let cc = Arc::clone(&critic_counter);
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_string_contains("\"deepseek-chat\""))
+        .respond_with(move |_: &wiremock::Request| {
+            let n = cc.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {"content": format!("Critique {n}")}}],
+                "total_cost_usd": 0.0005
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    let state = SharedState::new("Initial.".into());
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let cancel_token = CancellationToken::new();
+
+    let handle = {
+        let config = config.clone();
+        let runtime = runtime_from(&config);
+        let cancel = cancel_token.clone();
+        let state = state.clone();
+        tokio::spawn(async move {
+            run_spectacle(config, runtime, state, event_tx, cancel)
+                .await
+                .expect("run_spectacle should not error")
+        })
+    };
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    cancel_token.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+
+    let events = drain_events(&mut event_rx, Duration::from_millis(500)).await;
+
+    // The document version never advanced past the seed (v1 from the startup
+    // `state.update`), so the Critic's gate never opens.
+    let critic_outputs = count_events!(events, AppEvent::CriticOutput(_));
+    assert_eq!(
+        critic_outputs, 0,
+        "Critic must emit no output while the document is stuck at the seed, got {critic_outputs}"
+    );
+
+    let critique_ready = count_events!(events, AppEvent::CritiqueReady(_));
+    assert_eq!(
+        critique_ready, 0,
+        "Critic must emit no CritiqueReady while stuck at the seed, got {critique_ready}"
+    );
+
+    // No critique should have been stored either.
+    assert!(
+        state.read_critique().is_none(),
+        "no critique should be stored while the Writer never advances the document"
+    );
+
+    eprintln!("Critic-waits: {critic_outputs} critic outputs while stuck at seed (expected 0)");
 }
 
 // =========================================================================

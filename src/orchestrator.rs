@@ -37,6 +37,19 @@ fn reveal_dwell_ms(text_chars: usize, reveal_cps: u32) -> u64 {
     (type_ms + DWELL_MS).max(CYCLE_SLEEP_MS)
 }
 
+/// Decide whether the Critic should critique the current document snapshot.
+///
+/// The Critic only critiques a *new, completed Writer answer*: a document
+/// version that has advanced past the last one it critiqued (the seed baseline
+/// at start-up) and whose content is non-empty. This prevents the Critic from
+/// heckling the empty/initial seed before the Writer's first real revision
+/// lands, and ensures each completed answer is critiqued at most once.
+///
+/// Pure function of its inputs — unit-tested.
+fn critic_should_critique(doc_version: u64, last_critiqued: u64, content: &str) -> bool {
+    doc_version > last_critiqued && !content.trim().is_empty()
+}
+
 // ---------------------------------------------------------------------------
 // Context window helpers
 // ---------------------------------------------------------------------------
@@ -702,12 +715,18 @@ async fn critic_loop(
     // triggers a rebuild.
     let mut current_model = config.critic_model.clone();
 
+    // Baseline at the seed: the Critic only critiques document versions that
+    // advance *past* this (i.e. completed Writer revisions), never the seed.
+    let mut last_critiqued_version = state.current_version();
+
     loop {
         if cancel_token.is_cancelled() {
             break;
         }
 
         // ── Re-read live settings (copy out, drop the guard before .await) ──
+        // Done every cycle (even while poll-waiting) so live style/speed/cap
+        // changes stay responsive.
         let (want_model, style, speed, cap) = {
             let s = runtime.read().expect("runtime settings RwLock poisoned");
             (
@@ -720,6 +739,27 @@ async fn critic_loop(
         let reveal_cps = speed.cps();
         cost_ceiling.set_limit(cap);
 
+        let (doc_version, doc_content) = state.snapshot();
+
+        // ── Gate: wait for a new, completed Writer answer ──────────────────
+        // If the Writer hasn't produced a fresh non-empty revision since the
+        // last one we critiqued, poll-wait briefly (no LLM call, no critique,
+        // no `── vN ──` entry) and try again. This keeps the Critic pane empty
+        // until the Writer's first real answer lands.
+        if !critic_should_critique(doc_version, last_critiqued_version, &doc_content) {
+            tokio::select! {
+                _ = cancel_token.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_millis(CYCLE_SLEEP_MS)) => {}
+            }
+            continue;
+        }
+
+        // Mark this version critiqued *before* the LLM call, so a completed
+        // answer is critiqued at most once even if the call later errors.
+        last_critiqued_version = doc_version;
+
+        // Rebuild the client if the live model changed. Done only once the
+        // gate has passed — no point rebuilding during poll-waits.
         if want_model != current_model {
             match build_client(&want_model, "Critic", &config) {
                 Ok(c) => {
@@ -736,8 +776,6 @@ async fn critic_loop(
         // the critique has time to type out in the TUI. 0 on error / first
         // iter → the dwell floors at CYCLE_SLEEP_MS.
         let mut last_reply_chars = 0usize;
-
-        let (doc_version, doc_content) = state.snapshot();
 
         let critic_system = prompts::critics(style).to_string();
 
@@ -1067,6 +1105,38 @@ mod tests {
         let slow = reveal_dwell_ms(4000, 20);
         let fast = reveal_dwell_ms(4000, 80);
         assert!(fast < slow, "higher cps should shorten the dwell");
+    }
+
+    #[test]
+    fn critic_should_critique_skips_seed_version() {
+        // doc_version == last_critiqued → the Writer hasn't advanced past the
+        // seed yet, so the Critic must not critique.
+        assert!(!critic_should_critique(1, 1, "anything"));
+    }
+
+    #[test]
+    fn critic_should_critique_skips_empty_content() {
+        // A new version but empty content → nothing to critique.
+        assert!(!critic_should_critique(2, 1, ""));
+    }
+
+    #[test]
+    fn critic_should_critique_skips_whitespace_content() {
+        // Whitespace-only content counts as empty.
+        assert!(!critic_should_critique(2, 1, "   "));
+    }
+
+    #[test]
+    fn critic_should_critique_accepts_new_nonempty_version() {
+        // A new version with real content → critique it.
+        assert!(critic_should_critique(2, 1, "hi"));
+    }
+
+    #[test]
+    fn critic_should_critique_accepts_version_jump() {
+        // The Critic may fall behind; a jump past skipped versions still
+        // critiques the latest completed answer.
+        assert!(critic_should_critique(4, 1, "hi"));
     }
 
     #[test]

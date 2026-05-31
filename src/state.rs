@@ -169,6 +169,14 @@ impl SharedState {
         (guard.current_version(), guard.current_content())
     }
 
+    /// Return the current document version number under a read lock.
+    pub fn current_version(&self) -> u64 {
+        self.document
+            .read()
+            .expect("SharedState::current_version: document lock poisoned")
+            .current_version()
+    }
+
     /// Update the document content under an exclusive write lock.
     ///
     /// Returns the new version number.

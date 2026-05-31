@@ -276,9 +276,11 @@ Three concurrent loops share a single document in memory:
 └──────────────────────────────────────────────────────┘
 ```
 
-The two loops run independently. The Writer doesn't wait for the Critic and the
-Critic doesn't wait for the Writer. Each one grabs the latest snapshot of the
-shared document and works from that.
+The two loops run concurrently. The Writer doesn't wait for the Critic — it
+grabs the latest snapshot and works from that. The Critic, however, critiques
+the Writer's *completed* answers: it waits for a new, non-empty document
+revision (a version past the initial seed) before critiquing, and critiques each
+such revision once, so it never heckles the blank starting page.
 
 The **Writer** folds the critique history into its prompt (pruned at 90% of the
 context window), revises the document, and emits the result. If the Critic was
