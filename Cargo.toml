@@ -2,6 +2,9 @@
 name = "agentic-inferno"
 version = "0.1.0"
 edition = "2021"
+description = "A terminal spectacle where Writer and Critic LLM agents duel in an endless loop of revision and beratement"
+homepage = "https://github.com/SciRustaceans/agentic-inferno"
+repository = "https://github.com/SciRustaceans/agentic-inferno"
 
 [dependencies]
 ratatui = { version = "0.29", default-features = false, features = ["crossterm", "macros"] }
@@ -27,3 +30,8 @@ tempfile = "3"
 [lib]
 name = "agentic_inferno"
 path = "src/lib.rs"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
