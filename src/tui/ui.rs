@@ -130,10 +130,15 @@ pub fn render(frame: &mut Frame, app: &App) {
         .read()
         .expect("writer_buffer RwLock poisoned")
         .content();
+    let writer_title = if app.writer_version > 0 {
+        format!("Writer [v{}]", app.writer_version)
+    } else {
+        "Writer".to_string()
+    };
     let writer_paragraph = Paragraph::new(writer_text)
         .block(
             Block::default()
-                .title("Writer")
+                .title(writer_title)
                 .borders(Borders::ALL)
                 .border_style(writer_border),
         )
@@ -185,10 +190,17 @@ pub fn render(frame: &mut Frame, app: &App) {
             );
         frame.render_widget(apology_paragraph, apology_area);
     } else {
-        let status = format!(
-            "Running... | Cost: ${:.2}/${:.2} | Esc to stop",
+        let mut status = format!(
+            "Running... | Cost: ${:.2}/${:.2}",
             app.cost_spent, app.cost_limit
         );
+        if app.writer_version > 0 {
+            status.push_str(&format!(
+                " | Writer revision v{} complete",
+                app.writer_version
+            ));
+        }
+        status.push_str(" | Esc to stop");
         let status_paragraph = Paragraph::new(status)
             .block(Block::default().title("Penance").borders(Borders::ALL))
             .alignment(Alignment::Center);

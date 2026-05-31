@@ -195,8 +195,8 @@ fn handle_app_event(app: &mut ui::App, event: AppEvent) {
         AppEvent::WriterOutput(chunk) => {
             if let Ok(mut buf) = app.writer_buffer.write() {
                 buf.push(&chunk);
+                buf.scroll_to_bottom();
             }
-            app.writer_version += 1;
         }
         AppEvent::CriticOutput(chunk) => {
             if let Ok(mut buf) = app.critic_buffer.write() {
@@ -207,7 +207,10 @@ fn handle_app_event(app: &mut ui::App, event: AppEvent) {
         AppEvent::ApologyReady(text) => {
             app.apology_text = Some(text);
         }
-        AppEvent::WriterDone(_) | AppEvent::CritiqueReady(_) => {}
+        AppEvent::WriterDone(version) => {
+            app.writer_version = version;
+        }
+        AppEvent::CritiqueReady(_) => {}
         AppEvent::ApologyTriggered => {}
         AppEvent::Error(err) => {
             app.error = Some(err);

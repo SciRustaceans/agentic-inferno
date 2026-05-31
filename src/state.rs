@@ -84,9 +84,18 @@ impl DocumentBuffer {
 /// Because [`std::sync::RwLock`] permits any number of concurrent readers, the
 /// Critic and TUI can both read simultaneously without blocking each other.
 /// A writer only blocks when it cannot acquire the exclusive write lock.
+///
+/// # Critique buffer
+///
+/// The `latest_critique` field holds the most recent critique from the Critic
+/// loop: `(document_version_when_criticised, critique_text)`.  The Writer loop
+/// reads this before each revision cycle to incorporate feedback.  A separate
+/// `RwLock` avoids contention with document readers.
 #[derive(Debug, Clone)]
 pub struct SharedState {
     pub document: Arc<RwLock<DocumentBuffer>>,
+    /// Latest critique: `(document_version, critique_text)`.
+    pub latest_critique: Arc<RwLock<Option<(u64, String)>>>,
 }
 
 impl SharedState {
@@ -94,7 +103,30 @@ impl SharedState {
     pub fn new(initial_content: String) -> Self {
         Self {
             document: Arc::new(RwLock::new(DocumentBuffer::new(initial_content))),
+            latest_critique: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Write a critique into the shared buffer.
+    ///
+    /// `version` is the document version the critique was based on.
+    pub fn write_critique(&self, version: u64, text: String) {
+        let mut guard = self
+            .latest_critique
+            .write()
+            .expect("SharedState::write_critique: latest_critique lock poisoned");
+        *guard = Some((version, text));
+    }
+
+    /// Read the latest critique, if any.
+    ///
+    /// Returns `(document_version, critique_text)` or `None` if no critique
+    /// has been written yet.
+    pub fn read_critique(&self) -> Option<(u64, String)> {
+        self.latest_critique
+            .read()
+            .expect("SharedState::read_critique: latest_critique lock poisoned")
+            .clone()
     }
 
     /// Atomically read the current version and content under a single read

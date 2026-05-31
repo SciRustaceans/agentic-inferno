@@ -6,17 +6,13 @@ use tokio_util::sync::CancellationToken;
 use crate::app::AppEvent;
 use crate::config::Config;
 use crate::error::AppError;
-use crate::prompts::WRITER_SYSTEM_PROMPT;
+use crate::prompts::{self, WRITER_SYSTEM_PROMPT};
 use crate::providers::{detect_provider, ChatRequest, LlmClient, Provider};
 use crate::state::SharedState;
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-/// Mock critique string used until the real Critic loop is implemented (Task 16).
-const MOCK_CRITIQUE: &str =
-    "Your writing lacks clarity, structure, and purpose. Try again.";
 
 /// Pause between Writer loop cycles to avoid tight spinning on the LLM API.
 const CYCLE_SLEEP_MS: u64 = 500;
@@ -25,20 +21,18 @@ const CYCLE_SLEEP_MS: u64 = 500;
 // Orchestrator entry point
 // ---------------------------------------------------------------------------
 
-/// Launch the Writer-only spectacle loop.
+/// Launch the Writer and Critic spectacle loops concurrently.
 ///
-/// Reads the input document, initialises [`SharedState`], builds the Writer
-/// [`LlmClient`], and spawns a background task that continuously revises the
-/// document.  The Critic is mocked for now — a static critique string is fed
-/// to the Writer each cycle.
+/// Both loops share the same [`SharedState`] and [`CancellationToken`]. The
+/// Writer continuously revises the document while the Critic independently
+/// inspects the latest version and produces entertainment-only commentary.
 ///
 /// # Lifecycle
 ///
 /// 1. Load and validate the input document.
-/// 2. Put initial content into `SharedState` and send a `WriterOutput` event
-///    so the TUI displays the starting document.
-/// 3. Build the LLM client for the Writer model.
-/// 4. Spawn the Writer loop as a `tokio::spawn`ed task.
+/// 2. Put initial content into `SharedState` and send a `WriterOutput` event.
+/// 3. Build LLM clients for both the Writer and Critic models.
+/// 4. Spawn both loops as independent `tokio::spawn`ed tasks.
 /// 5. Wait for the `cancel_token` (triggered by Esc/q in the TUI).
 /// 6. Send `AppEvent::Shutdown` to the TUI.
 pub async fn run_spectacle(
@@ -53,21 +47,33 @@ pub async fn run_spectacle(
     let _ = event_tx.send(AppEvent::WriterOutput(initial_content));
 
     let writer_client = build_llm_client(&config)?;
+    let critic_client = build_critic_client(&config)?;
 
-    let task_event_tx = event_tx.clone();
-    let task_state = state.clone();
-    let task_cancel = cancel_token.clone();
+    // Writer task
+    {
+        let writer_event_tx = event_tx.clone();
+        let writer_state = state.clone();
+        let writer_cancel = cancel_token.clone();
+        let writer_config = config.clone();
 
-    tokio::spawn(async move {
-        writer_loop(
-            writer_client,
-            task_state,
-            task_event_tx,
-            task_cancel,
-            config,
-        )
-        .await;
-    });
+        tokio::spawn(async move {
+            writer_loop(writer_client, writer_state, writer_event_tx, writer_cancel, writer_config)
+                .await;
+        });
+    }
+
+    // Critic task
+    {
+        let critic_event_tx = event_tx.clone();
+        let critic_state = state.clone();
+        let critic_cancel = cancel_token.clone();
+        let critic_config = config;
+
+        tokio::spawn(async move {
+            critic_loop(critic_client, critic_state, critic_event_tx, critic_cancel, critic_config)
+                .await;
+        });
+    }
 
     cancel_token.cancelled().await;
 
@@ -82,9 +88,16 @@ pub async fn run_spectacle(
 
 /// Core Writer loop — continuously revises the document with LLM calls.
 ///
-/// Snapshot the current document, build a prompt with the latest critique,
-/// call the LLM, update shared state, and emit events to the TUI.  Errors
-/// are reported via `AppEvent::Error` but the loop continues.
+/// Each cycle:
+/// 1. Snapshot the current document content.
+/// 2. Read the latest critique from [`SharedState`]. If unavailable (the Critic
+///    has not completed a cycle yet), skip critique context entirely.
+/// 3. Check version relevance of the critique vs. current document version.
+///    Log a warning on mismatch but still incorporate the feedback.
+/// 4. Build the prompt: current document + critique (if available).
+/// 5. Call the Writer LLM, update shared state, emit events.
+///
+/// Errors are reported via `AppEvent::Error` but the loop continues.
 ///
 /// # Cancellation
 ///
@@ -104,9 +117,24 @@ async fn writer_loop(
             break;
         }
 
-        let (_version, current_content) = state.snapshot();
+        let (current_version, current_content) = state.snapshot();
 
-        let prompt_text = format!("{}\n\n[CRITIQUE]: {}", current_content, MOCK_CRITIQUE);
+        let critique_context = match state.read_critique() {
+            Some((critique_version, critique_text)) => {
+                if critique_version != current_version {
+                    eprintln!(
+                        "Writer: critique version {critique_version} is stale (document at {current_version}), applying anyway",
+                    );
+                }
+                format!("\n\nThe Critic said: {}\n\nNow revise the document accordingly.", critique_text)
+            }
+            None => {
+                // No critique available yet — skip critique context entirely.
+                String::new()
+            }
+        };
+
+        let prompt_text = format!("{current_content}{critique_context}");
 
         let request = ChatRequest {
             system: WRITER_SYSTEM_PROMPT.to_string(),
@@ -144,16 +172,106 @@ async fn writer_loop(
 }
 
 // ---------------------------------------------------------------------------
+// Critic loop (runs in a spawned task)
+// ---------------------------------------------------------------------------
+
+/// Core Critic loop — continuously critiques the current document version.
+///
+/// Each cycle:
+/// 1. Snapshot the current document version + content from [`SharedState`].
+/// 2. Build a Critic prompt via [`prompts::critics`] using `config.critic_style`.
+/// 3. Call the Critic LLM (cheap model recommended, e.g. deepseek-chat).
+/// 4. Write the critique into `SharedState` via `write_critique`.
+/// 5. Emit `CriticOutput` and `CritiqueReady` events to the TUI.
+/// 6. Sleep 500ms before the next cycle.
+///
+/// The Critic never produces constructive feedback, rewrites, or scoring —
+/// its output is pure entertainment. The document version captured at the
+/// start of each cycle is stored alongside the critique text so the Writer
+/// can detect stale feedback.
+///
+/// # Cancellation
+///
+/// Same `tokio::select!` pattern as the Writer loop — responds within ~500ms.
+async fn critic_loop(
+    client: LlmClient,
+    state: SharedState,
+    event_tx: UnboundedSender<AppEvent>,
+    cancel_token: CancellationToken,
+    config: Config,
+) {
+    let mut total_cost_usd: f64 = 0.0;
+
+    loop {
+        if cancel_token.is_cancelled() {
+            break;
+        }
+
+        let (doc_version, doc_content) = state.snapshot();
+
+        let critic_system = prompts::critics(config.critic_style).to_string();
+
+        let request = ChatRequest {
+            system: critic_system,
+            user: doc_content,
+            model: config.critic_model.clone(),
+            temperature: config.temperature as f32,
+            max_tokens: config.max_tokens,
+        };
+
+        match client.complete(request, config.timeout_secs).await {
+            Ok(reply) => {
+                if let Some(cost) = reply.cost_usd {
+                    total_cost_usd += cost;
+                    eprintln!(
+                        "Critic: cycle cost ${cost:.6}, total ${total_cost_usd:.6}",
+                    );
+                }
+
+                state.write_critique(doc_version, reply.text.clone());
+
+                let _ = event_tx.send(AppEvent::CriticOutput(reply.text));
+                let _ = event_tx.send(AppEvent::CritiqueReady(doc_version));
+            }
+            Err(err) => {
+                let _ = event_tx.send(AppEvent::Error(err));
+            }
+        }
+
+        tokio::select! {
+            _ = cancel_token.cancelled() => {
+                break;
+            }
+            _ = tokio::time::sleep(Duration::from_millis(CYCLE_SLEEP_MS)) => {}
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // LLM client construction
 // ---------------------------------------------------------------------------
 
 /// Build an [`LlmClient`] for the Writer model based on the resolved configuration.
+fn build_llm_client(config: &Config) -> Result<LlmClient, AppError> {
+    build_client(&config.writer_model, "Writer", config)
+}
+
+/// Build an [`LlmClient`] for the Critic model based on the resolved configuration.
+fn build_critic_client(config: &Config) -> Result<LlmClient, AppError> {
+    build_client(&config.critic_model, "Critic", config)
+}
+
+/// Shared client builder for the Writer and Critic.
 ///
 /// Detects the provider from the model name, reads the API key from the
 /// environment, resolves the base URL (config override → env var → default),
 /// and constructs the appropriate client variant.
-fn build_llm_client(config: &Config) -> Result<LlmClient, AppError> {
-    let (provider, model_name) = detect_provider(&config.writer_model, "Writer")?;
+fn build_client(
+    model: &str,
+    agent_name: &str,
+    config: &Config,
+) -> Result<LlmClient, AppError> {
+    let (provider, model_name) = detect_provider(model, agent_name)?;
 
     match provider {
         Provider::Anthropic => Ok(LlmClient::AnthropicCli {
