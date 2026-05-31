@@ -10,6 +10,18 @@ outputs in split panes. There's no convergence and no "done" state. The loop
 runs until you hit Esc or the cost ceiling is reached. Your original document is
 never touched.
 
+## Screenshots
+
+The UI is the real `render()` — only the pane text is sample content. The images
+are generated with `cargo run --example screenshots` (no API calls), then
+rasterized from the SVGs in `docs/` with `rsvg-convert`.
+
+![The spectacle: Writer and Critic panes with the animated AGENT INFERNO banner](docs/screenshot-main.png)
+
+![Live settings menu (press `s`) — change models, tone, speed, cost, and prompt mid-run](docs/screenshot-settings.png)
+
+![The Writer's apology popup](docs/screenshot-apology.png)
+
 ## Quick start
 
 ```bash
