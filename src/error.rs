@@ -70,6 +70,10 @@ pub enum AppError {
     #[error("claude CLI not found on PATH. Install it from https://claude.ai/download or select a non-Anthropic model.")]
     ClaudeNotFound,
 
+    /// A configuration value failed validation.
+    #[error("Invalid configuration: {0}")]
+    Validation(String),
+
     /// The terminal is too small for the TUI layout.
     #[error("Terminal too small: {0}x{1}. Minimum size is 80x24. Resize your terminal and try again.")]
     TerminalTooSmall(usize, usize),
@@ -84,7 +88,8 @@ impl From<AppError> for ExitCode {
             | AppError::MissingInput
             | AppError::LeakGuard(_)
             | AppError::ClaudeNotFound
-            | AppError::TerminalTooSmall(_, _) => ExitCode::from(64),
+            | AppError::TerminalTooSmall(_, _)
+            | AppError::Validation(_) => ExitCode::from(64),
 
             // Runtime / transient errors → 70 (EX_SOFTWARE)
             AppError::Http { .. }
@@ -190,6 +195,13 @@ mod tests {
     }
 
     #[test]
+    fn test_validation_message() {
+        let err = AppError::Validation("temperature must be in [0.0, 2.0]".into());
+        let msg = err.to_string();
+        assert!(msg.contains("temperature must be in"));
+    }
+
+    #[test]
     fn test_terminal_too_small_message() {
         let err = AppError::TerminalTooSmall(40, 10);
         let msg = err.to_string();
@@ -222,6 +234,10 @@ mod tests {
         assert_eq!(to_exit_code(AppError::LeakGuard("x".into())), ExitCode::from(64));
         assert_eq!(to_exit_code(AppError::ClaudeNotFound), ExitCode::from(64));
         assert_eq!(to_exit_code(AppError::TerminalTooSmall(40, 10)), ExitCode::from(64));
+        assert_eq!(
+            to_exit_code(AppError::Validation("bad".into())),
+            ExitCode::from(64)
+        );
 
         // Runtime errors → 70
         assert_eq!(
@@ -247,7 +263,7 @@ mod tests {
             ExitCode::from(70)
         );
         assert_eq!(
-            to_exit_code(AppError::Io(std::io::Error::new(std::io::ErrorKind::Other, "x"))),
+            to_exit_code(AppError::Io(std::io::Error::other("x"))),
             ExitCode::from(70)
         );
         assert_eq!(
