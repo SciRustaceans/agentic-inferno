@@ -35,12 +35,24 @@ pub enum AppEvent {
     /// apology workflow.
     ApologyTriggered,
 
+    /// Current apology cooldown remaining, in seconds.
+    ///
+    /// `Some(secs)` when an active cooldown is in effect; `None` when the
+    /// cooldown has expired or no apology has occurred yet.
+    ApologyCooldown(Option<u64>),
+
     /// An error occurred in a spawned task or the orchestrator.
     Error(AppError),
 
     /// The cost ceiling is approaching its limit.
-    /// Fields: (current_spend, limit) in USD.
-    CostWarning(f64, f64),
+    /// Fields: spent (total), limit (ceiling), per-agent costs in USD.
+    CostWarning {
+        spent: f64,
+        limit: f64,
+        writer_cost: f64,
+        critic_cost: f64,
+        apology_cost: f64,
+    },
 
     /// The loop detection guard triggered — the output is repetitive and no
     /// further progress is expected.

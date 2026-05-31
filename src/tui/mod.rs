@@ -239,12 +239,24 @@ fn handle_app_event(app: &mut ui::App, event: AppEvent) {
         AppEvent::Error(err) => {
             app.error = Some(err);
         }
-        AppEvent::CostWarning(spent, limit) => {
+        AppEvent::CostWarning {
+            spent,
+            limit,
+            writer_cost,
+            critic_cost,
+            apology_cost,
+        } => {
             app.cost_spent = spent;
             app.cost_limit = limit;
+            app.writer_cost = writer_cost;
+            app.critic_cost = critic_cost;
+            app.apology_cost = apology_cost;
         }
         AppEvent::LoopExhausted => {
             app.state = AppState::Done;
+        }
+        AppEvent::ApologyCooldown(remaining) => {
+            app.apology_cooldown = remaining;
         }
         AppEvent::Shutdown => {
             app.state = AppState::Done;

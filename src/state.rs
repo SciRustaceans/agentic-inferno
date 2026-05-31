@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 /// Maximum number of historical versions kept in the buffer.
 const MAX_HISTORY: usize = 50;
@@ -72,6 +73,19 @@ impl DocumentBuffer {
     }
 }
 
+/// Tracks the cooldown state for apology LLM calls.
+///
+/// The cooldown rule is: minimum 30 seconds **or** 3 critique cycles since the
+/// last apology, whichever is longer. Both conditions must be satisfied before
+/// a new apology can fire.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ApologyCooldown {
+    /// Wall clock of the most recent apology LLM call.
+    pub last_apology_time: Option<Instant>,
+    /// Number of successful critic loop cycles since the last apology.
+    pub cycles_since_apology: u32,
+}
+
 /// Shared state for the document, reference-counted and protected by a
 /// read-write lock.
 ///
@@ -91,11 +105,22 @@ impl DocumentBuffer {
 /// loop: `(document_version_when_criticised, critique_text)`.  The Writer loop
 /// reads this before each revision cycle to incorporate feedback.  A separate
 /// `RwLock` avoids contention with document readers.
+///
+/// # Apology cooldown
+///
+/// The `apology_cooldown` field tracks the time and cycle count since the last
+/// apology.  Both the Writer and Critic loops may read/write this state:
+///
+/// - Writer loop checks cooldown when detecting `[APOLOGY]` and resets it on
+///   a successful apology.
+/// - Critic loop increments `cycles_since_apology` after each successful cycle.
 #[derive(Debug, Clone)]
 pub struct SharedState {
     pub document: Arc<RwLock<DocumentBuffer>>,
     /// Latest critique: `(document_version, critique_text)`.
     pub latest_critique: Arc<RwLock<Option<(u64, String)>>>,
+    /// Apology cooldown state shared between Writer and Critic loops.
+    pub apology_cooldown: Arc<RwLock<ApologyCooldown>>,
 }
 
 impl SharedState {
@@ -104,6 +129,7 @@ impl SharedState {
         Self {
             document: Arc::new(RwLock::new(DocumentBuffer::new(initial_content))),
             latest_critique: Arc::new(RwLock::new(None)),
+            apology_cooldown: Arc::new(RwLock::new(ApologyCooldown::default())),
         }
     }
 
@@ -152,6 +178,39 @@ impl SharedState {
             .write()
             .expect("SharedState::update: document lock poisoned");
         guard.update(text)
+    }
+
+    // -----------------------------------------------------------------------
+    // Apology cooldown helpers
+    // -----------------------------------------------------------------------
+
+    /// Read the current apology cooldown state.
+    pub fn read_apology_cooldown(&self) -> ApologyCooldown {
+        *self
+            .apology_cooldown
+            .read()
+            .expect("SharedState::read_apology_cooldown: lock poisoned")
+    }
+
+    /// Mark an apology as having just fired — records the current instant and
+    /// resets the critique cycle counter.
+    pub fn mark_apology_fired(&self) {
+        let mut guard = self
+            .apology_cooldown
+            .write()
+            .expect("SharedState::mark_apology_fired: lock poisoned");
+        guard.last_apology_time = Some(Instant::now());
+        guard.cycles_since_apology = 0;
+    }
+
+    /// Increment the critique cycle counter (called by the Critic loop after
+    /// each successful LLM cycle).
+    pub fn increment_critique_cycles(&self) {
+        let mut guard = self
+            .apology_cooldown
+            .write()
+            .expect("SharedState::increment_critique_cycles: lock poisoned");
+        guard.cycles_since_apology = guard.cycles_since_apology.saturating_add(1);
     }
 }
 

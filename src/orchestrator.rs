@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::mpsc::UnboundedSender;
@@ -6,9 +8,10 @@ use tokio_util::sync::CancellationToken;
 use crate::app::AppEvent;
 use crate::config::Config;
 use crate::error::AppError;
-use crate::prompts::{self, WRITER_SYSTEM_PROMPT};
+use crate::guards::{semantic_hash, CostCeiling, LoopDetection};
+use crate::prompts::{self, APOLOGY_SYSTEM_PROMPT, WRITER_SYSTEM_PROMPT};
 use crate::providers::{detect_provider, ChatRequest, LlmClient, Provider};
-use crate::state::SharedState;
+use crate::state::{ApologyCooldown, SharedState};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -16,6 +19,34 @@ use crate::state::SharedState;
 
 /// Pause between Writer loop cycles to avoid tight spinning on the LLM API.
 const CYCLE_SLEEP_MS: u64 = 500;
+
+// ---------------------------------------------------------------------------
+// Context window helpers
+// ---------------------------------------------------------------------------
+
+/// Rough token estimate: 1 token ≈ 4 characters for English text.
+///
+/// This is a heuristic, not an exact tokenizer. Good enough for context window
+/// management — we only need to stay within ~10% of the model's limit.
+fn estimate_tokens(text: &str) -> usize {
+    text.len() / 4
+}
+
+/// Estimate the model's context window size in tokens from its name.
+///
+/// Returns well-known limits for identified models and a conservative 128K
+/// default for unrecognised names. Matches are case-insensitive substring
+/// checks so that `"gpt-4o"`, `"gpt-4-turbo"`, etc. all resolve correctly.
+fn estimate_model_context_window(model: &str) -> usize {
+    let lowered = model.to_ascii_lowercase();
+    if lowered.contains("claude") {
+        200_000
+    } else if lowered.contains("deepseek") {
+        65_536
+    } else {
+        128_000
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Orchestrator entry point
@@ -49,18 +80,43 @@ pub async fn run_spectacle(
     let writer_client = build_llm_client(&config)?;
     let critic_client = build_critic_client(&config)?;
 
+    // ── Cost ceiling guard ───────────────────────────────────────────
+    // Shared across Writer, Critic, and Apology loops. Each successful
+    // LLM call records its cost. If the ceiling is exceeded the token is
+    // cancelled and the spectacle stops.
+
+    let cost_ceiling = Arc::new(CostCeiling::new(config.max_cost_usd));
+    let writer_cost: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
+    let critic_cost: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
+    let _apology_cost: Arc<Mutex<f64>> = Arc::new(Mutex::new(0.0));
+
     // ── Spawn concurrent Writer + Critic loops ───────────────────────
     // JoinHandles are retained so we can await graceful shutdown.
+
+    // Per-spectacle loop detection: window=5, min_repeats=3.
+    let loop_detector = Arc::new(Mutex::new(LoopDetection::new(5, 3)));
 
     let writer_handle = {
         let writer_event_tx = event_tx.clone();
         let writer_state = state.clone();
         let writer_cancel = cancel_token.clone();
         let writer_config = config.clone();
+        let writer_cc = Arc::clone(&cost_ceiling);
+        let writer_ac = Arc::clone(&writer_cost);
+        let writer_ld = Arc::clone(&loop_detector);
 
         tokio::spawn(async move {
-            writer_loop(writer_client, writer_state, writer_event_tx, writer_cancel, writer_config)
-                .await;
+            writer_loop(
+                writer_client,
+                writer_state,
+                writer_event_tx,
+                writer_cancel,
+                writer_config,
+                writer_cc,
+                writer_ac,
+                writer_ld,
+            )
+            .await;
         })
     };
 
@@ -69,10 +125,20 @@ pub async fn run_spectacle(
         let critic_state = state.clone();
         let critic_cancel = cancel_token.clone();
         let critic_config = config;
+        let critic_cc = Arc::clone(&cost_ceiling);
+        let critic_ac = Arc::clone(&critic_cost);
 
         tokio::spawn(async move {
-            critic_loop(critic_client, critic_state, critic_event_tx, critic_cancel, critic_config)
-                .await;
+            critic_loop(
+                critic_client,
+                critic_state,
+                critic_event_tx,
+                critic_cancel,
+                critic_config,
+                critic_cc,
+                critic_ac,
+            )
+            .await;
         })
     };
 
@@ -149,6 +215,28 @@ pub async fn run_spectacle(
 // Writer loop (runs in a spawned task)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Apology cooldown helpers
+// ---------------------------------------------------------------------------
+
+/// Return the remaining cooldown time in seconds, if cooldown is active.
+///
+/// Returns `Some(secs)` while the cooldown is in effect, `None` once both
+/// the time and cycle conditions are satisfied (or no apology has occurred).
+fn cooldown_remaining_secs(cooldown: &ApologyCooldown) -> Option<u64> {
+    let last_time = cooldown.last_apology_time?;
+    let elapsed_secs = last_time.elapsed().as_secs();
+
+    if elapsed_secs < 30 {
+        Some(30 - elapsed_secs)
+    } else if cooldown.cycles_since_apology < 3 {
+        // Time condition met, still waiting on cycles.
+        Some(0)
+    } else {
+        None
+    }
+}
+
 /// Core Writer loop — continuously revises the document with LLM calls.
 ///
 /// Each cycle:
@@ -162,18 +250,31 @@ pub async fn run_spectacle(
 ///
 /// Errors are reported via `AppEvent::Error` but the loop continues.
 ///
+/// # Apology detection
+///
+/// After each successful LLM response, the reply is scanned for the `[APOLOGY]`
+/// marker. If found and the cooldown has expired, a separate apology LLM call
+/// is made and the result is emitted as `AppEvent::ApologyReady`. If the
+/// cooldown is still active, the trigger is suppressed and logged.
+///
 /// # Cancellation
 ///
 /// Uses a `tokio::select!` on the `cancel_token.cancelled()` future and a
 /// short sleep so the loop responds to cancellation within ~500ms.
+#[allow(clippy::too_many_arguments)]
 async fn writer_loop(
     client: LlmClient,
     state: SharedState,
     event_tx: UnboundedSender<AppEvent>,
     cancel_token: CancellationToken,
     config: Config,
+    cost_ceiling: Arc<CostCeiling>,
+    writer_cost: Arc<Mutex<f64>>,
+    loop_detector: Arc<Mutex<LoopDetection>>,
 ) {
-    let mut total_cost_usd: f64 = 0.0;
+    // ── Context window management ─────────────────────────────────────────
+    let model_context_window = estimate_model_context_window(&config.writer_model);
+    let mut critique_history: VecDeque<(String, usize)> = VecDeque::new();
 
     loop {
         if cancel_token.is_cancelled() {
@@ -182,20 +283,54 @@ async fn writer_loop(
 
         let (current_version, current_content) = state.snapshot();
 
-        let critique_context = match state.read_critique() {
-            Some((critique_version, critique_text)) => {
-                if critique_version != current_version {
-                    eprintln!(
-                        "Writer: critique version {critique_version} is stale (document at {current_version}), applying anyway",
-                    );
-                }
-                format!("\n\nThe Critic said: {}\n\nNow revise the document accordingly.", critique_text)
+        // ── Collect latest critique into history ──────────────────────────
+        if let Some((critique_version, critique_text)) = state.read_critique() {
+            if critique_version != current_version {
+                eprintln!(
+                    "Writer: critique version {critique_version} is stale (document at {current_version}), applying anyway",
+                );
             }
-            None => {
-                // No critique available yet — skip critique context entirely.
-                String::new()
+            // Only add to history if it's actually new text (avoid duplicating
+            // the same critique across fast Writer cycles).
+            let is_new = critique_history
+                .back()
+                .map(|(text, _)| text != &critique_text)
+                .unwrap_or(true);
+            if is_new {
+                let crit_tokens = estimate_tokens(&critique_text);
+                critique_history.push_back((critique_text, crit_tokens));
             }
-        };
+        }
+
+        // ── Context window check — warn at 80%, prune oldest at 90% ──────
+        let system_tokens = estimate_tokens(WRITER_SYSTEM_PROMPT);
+        let doc_tokens = estimate_tokens(&current_content);
+        let crit_tokens_total: usize = critique_history.iter().map(|(_, t)| t).sum();
+        let current_estimate = system_tokens + doc_tokens + crit_tokens_total;
+
+        let pct = current_estimate as f64 / model_context_window as f64;
+        if pct > 0.90 {
+            if let Some((_dropped_text, dropped_tokens)) = critique_history.pop_front() {
+                eprintln!(
+                    "Writer: context window at {pct:.1}% ({current_estimate}/{model_context_window}) \
+                     — dropping oldest critique ({dropped_tokens} tokens)",
+                );
+            }
+        } else if pct > 0.80 {
+            eprintln!(
+                "Writer: context window at {pct:.1}% ({current_estimate}/{model_context_window})",
+            );
+        }
+
+        // ── Build prompt with full critique history ───────────────────────
+        let mut critique_context = String::new();
+        if !critique_history.is_empty() {
+            critique_context.push_str("\n\nThe Critic has said:\n");
+            for (i, (text, _)) in critique_history.iter().enumerate() {
+                critique_context.push_str(&format!("--- Critique {} ---\n{}\n", i + 1, text));
+            }
+            critique_context.push_str("Now revise the document accordingly.");
+        }
 
         let prompt_text = format!("{current_content}{critique_context}");
 
@@ -210,15 +345,160 @@ async fn writer_loop(
         match client.complete(request, config.timeout_secs).await {
             Ok(reply) => {
                 if let Some(cost) = reply.cost_usd {
-                    total_cost_usd += cost;
+                    // Track per-agent cost (only on success).
+                    *writer_cost.lock().expect("writer_cost mutex poisoned") += cost;
+
                     eprintln!(
-                        "Writer: cycle cost ${cost:.6}, total ${total_cost_usd:.6}",
+                        "Writer: cycle cost ${cost:.6}, writer total ${:.6}",
+                        *writer_cost.lock().expect("writer_cost mutex poisoned"),
                     );
+
+                    // Enforce cost ceiling. If exceeded, cancel and exit.
+                    if let Err(AppError::CostCeilingExceeded(spent, limit)) =
+                        cost_ceiling.record(cost)
+                    {
+                        let _ = event_tx.send(AppEvent::Error(AppError::CostCeilingExceeded(
+                            spent, limit,
+                        )));
+                        cancel_token.cancel();
+                        break;
+                    }
+
+                    // Send cost update to TUI.
+                    let _ = event_tx.send(AppEvent::CostWarning {
+                        spent: cost_ceiling.spent(),
+                        limit: cost_ceiling.limit(),
+                        writer_cost: *writer_cost.lock().expect("writer_cost mutex poisoned"),
+                        critic_cost: 0.0, // will be updated by critic loop
+                        apology_cost: 0.0,
+                    });
                 }
 
-                let new_version = state.update(reply.text.clone());
-                let _ = event_tx.send(AppEvent::WriterOutput(reply.text));
-                let _ = event_tx.send(AppEvent::WriterDone(new_version));
+                // Scan for [APOLOGY] marker (case-insensitive).  If present,
+                // split the response: the document part goes into shared state
+                // and the apology text is sent to the apology bar via ApologyReady,
+                // gated by the cooldown.  The full text (including the marker)
+                // always goes to the Writer pane for audience spectacle.
+                let new_version = if let Some(marker_idx) = find_apology_marker(&reply.text) {
+                    let document_text = reply.text[..marker_idx].trim().to_string();
+
+                    // Semantic loop detection on the document content.
+                    let text_hash = semantic_hash(&document_text);
+                    if let Err(err) = loop_detector
+                        .lock()
+                        .expect("LoopDetection mutex poisoned")
+                        .check(text_hash)
+                    {
+                        let _ = event_tx.send(AppEvent::LoopExhausted);
+                        cancel_token.cancel();
+                        eprintln!("Writer: loop exhausted — {err}");
+                        break;
+                    }
+
+                    let new_ver = state.update(document_text);
+
+                    // The full text (including the marker) goes to the TUI for
+                    // display — the audience should see the theatrical apology.
+                    let _ = event_tx.send(AppEvent::WriterOutput(reply.text));
+                    let _ = event_tx.send(AppEvent::WriterDone(new_ver));
+                    let _ = event_tx.send(AppEvent::ApologyTriggered);
+
+                    // ── Non-blocking apology LLM call ──────────────────
+                    //
+                    // Spawn a separate LLM call using the writer model with
+                    // APOLOGY_SYSTEM_PROMPT and the latest critique as user
+                    // prompt. Writer and Critic loops continue immediately.
+                    {
+                        let apology_state = state.clone();
+                        let apology_event_tx = event_tx.clone();
+                        let apology_config = config.clone();
+                        let apology_ceiling = Arc::clone(&cost_ceiling);
+
+                        tokio::spawn(async move {
+                            match build_client(
+                                &apology_config.writer_model,
+                                "Apology",
+                                &apology_config,
+                            ) {
+                                Ok(client) => {
+                                    let critique_text = apology_state
+                                        .read_critique()
+                                        .map(|(_, text)| text)
+                                        .unwrap_or_default();
+
+                                    let request = ChatRequest {
+                                        system: APOLOGY_SYSTEM_PROMPT.to_string(),
+                                        user: critique_text,
+                                        model: apology_config.writer_model.clone(),
+                                        temperature: apology_config.temperature as f32,
+                                        max_tokens: apology_config.max_tokens,
+                                    };
+
+                                    match client
+                                        .complete(request, apology_config.timeout_secs)
+                                        .await
+                                    {
+                                        Ok(reply) => {
+                                            if let Some(cost) = reply.cost_usd {
+                                                if let Err(err) = apology_ceiling.record(cost) {
+                                                    let _ = apology_event_tx
+                                                        .send(AppEvent::Error(err));
+                                                    return;
+                                                }
+                                                let _ = apology_event_tx.send(
+                                                    AppEvent::CostWarning {
+                                                        spent: apology_ceiling.spent(),
+                                                        limit: apology_ceiling.limit(),
+                                                        writer_cost: 0.0,
+                                                        critic_cost: 0.0,
+                                                        apology_cost: cost,
+                                                    },
+                                                );
+                                            }
+                                            let _ = apology_event_tx
+                                                .send(AppEvent::ApologyReady(reply.text));
+                                        }
+                                        Err(err) => {
+                                            let _ = apology_event_tx
+                                                .send(AppEvent::Error(err));
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    let _ = apology_event_tx.send(AppEvent::Error(err));
+                                }
+                            }
+                        });
+                    }
+
+                    eprintln!("Apology triggered: marker (apology follows marker in text)");
+                    new_ver
+                } else {
+                    // Semantic loop detection on the document content.
+                    let text_hash = semantic_hash(&reply.text);
+                    if let Err(err) = loop_detector
+                        .lock()
+                        .expect("LoopDetection mutex poisoned")
+                        .check(text_hash)
+                    {
+                        let _ = event_tx.send(AppEvent::LoopExhausted);
+                        cancel_token.cancel();
+                        eprintln!("Writer: loop exhausted — {err}");
+                        break;
+                    }
+
+                    let new_ver = state.update(reply.text.clone());
+                    let _ = event_tx.send(AppEvent::WriterOutput(reply.text));
+                    let _ = event_tx.send(AppEvent::WriterDone(new_ver));
+                    new_ver
+                };
+
+                let _ = new_version;
+
+                // Send cooldown status for the TUI status bar.
+                let current_cooldown = state.read_apology_cooldown();
+                let remaining = cooldown_remaining_secs(&current_cooldown);
+                let _ = event_tx.send(AppEvent::ApologyCooldown(remaining));
             }
             Err(err) => {
                 let _ = event_tx.send(AppEvent::Error(err));
@@ -262,9 +542,9 @@ async fn critic_loop(
     event_tx: UnboundedSender<AppEvent>,
     cancel_token: CancellationToken,
     config: Config,
+    cost_ceiling: Arc<CostCeiling>,
+    critic_cost: Arc<Mutex<f64>>,
 ) {
-    let mut total_cost_usd: f64 = 0.0;
-
     loop {
         if cancel_token.is_cancelled() {
             break;
@@ -285,16 +565,52 @@ async fn critic_loop(
         match client.complete(request, config.timeout_secs).await {
             Ok(reply) => {
                 if let Some(cost) = reply.cost_usd {
-                    total_cost_usd += cost;
+                    // Track per-agent cost (only on success).
+                    *critic_cost.lock().expect("critic_cost mutex poisoned") += cost;
+
                     eprintln!(
-                        "Critic: cycle cost ${cost:.6}, total ${total_cost_usd:.6}",
+                        "Critic: cycle cost ${cost:.6}, critic total ${:.6}",
+                        *critic_cost.lock().expect("critic_cost mutex poisoned"),
                     );
+
+                    // Enforce cost ceiling. If exceeded, cancel and exit.
+                    if let Err(AppError::CostCeilingExceeded(spent, limit)) =
+                        cost_ceiling.record(cost)
+                    {
+                        let _ = event_tx.send(AppEvent::Error(AppError::CostCeilingExceeded(
+                            spent, limit,
+                        )));
+                        cancel_token.cancel();
+                        break;
+                    }
+
+                    // Send cost update to TUI.
+                    let _ = event_tx.send(AppEvent::CostWarning {
+                        spent: cost_ceiling.spent(),
+                        limit: cost_ceiling.limit(),
+                        writer_cost: 0.0,
+                        critic_cost: *critic_cost.lock().expect("critic_cost mutex poisoned"),
+                        apology_cost: 0.0,
+                    });
+                }
+
+                // Keyword-based harshness detection: if the critique contains
+                // ≥3 harsh keywords, trigger the apology workflow regardless
+                // of whether the Writer's output contained a marker.
+                let kw_count = count_harsh_keywords(&reply.text);
+                if kw_count >= 3 {
+                    let _ = event_tx.send(AppEvent::ApologyTriggered);
+                    eprintln!("Apology triggered: keywords ({kw_count})");
                 }
 
                 state.write_critique(doc_version, reply.text.clone());
 
                 let _ = event_tx.send(AppEvent::CriticOutput(reply.text));
                 let _ = event_tx.send(AppEvent::CritiqueReady(doc_version));
+
+                // Increment apology cooldown cycle counter — each successful
+                // critic cycle brings us closer to satisfying the 3-cycle minimum.
+                state.increment_critique_cycles();
             }
             Err(err) => {
                 let _ = event_tx.send(AppEvent::Error(err));
@@ -397,4 +713,38 @@ fn resolve_base_url(provider: &Provider, config: &Config) -> Result<reqwest::Url
         .expect("non-Anthropic providers always have a default base URL");
     reqwest::Url::parse(default)
         .map_err(|_| AppError::Validation(format!("Invalid default base URL: {default}")))
+}
+
+// ---------------------------------------------------------------------------
+// Apology marker parser
+// ---------------------------------------------------------------------------
+
+/// Find a case-insensitive `[APOLOGY]` marker in `text`.
+///
+/// Returns the byte index of the opening `[` if the marker is found as a
+/// complete token (`[APOLOGY]`, `[apology]`, `[Apology]`, etc.).  Partial
+/// markers like `[APOL` without the closing `]` are NOT matched.
+fn find_apology_marker(text: &str) -> Option<usize> {
+    let marker_lower = "[apology]";
+    let text_lower = text.to_ascii_lowercase();
+    text_lower.find(marker_lower)
+}
+
+/// Count how many distinct harsh keywords appear in `text` (case-insensitive).
+///
+/// Harsh keywords: "incompetent", "worthless", "pathetic", "garbage",
+/// "useless", "hopeless", "embarrassing", "disgrace".
+fn count_harsh_keywords(text: &str) -> usize {
+    const KEYWORDS: [&str; 8] = [
+        "incompetent",
+        "worthless",
+        "pathetic",
+        "garbage",
+        "useless",
+        "hopeless",
+        "embarrassing",
+        "disgrace",
+    ];
+    let lower = text.to_ascii_lowercase();
+    KEYWORDS.iter().filter(|kw| lower.contains(*kw)).count()
 }

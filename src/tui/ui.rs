@@ -46,12 +46,23 @@ pub struct App {
     pub cost_spent: f64,
     /// Cost ceiling from configuration, in USD.
     pub cost_limit: f64,
+    /// Writer agent cumulative cost, in USD.
+    pub writer_cost: f64,
+    /// Critic agent cumulative cost, in USD.
+    pub critic_cost: f64,
+    /// Apology agent cumulative cost, in USD.
+    pub apology_cost: f64,
     /// Monotonic version counter for Writer content — bumped on each `WriterOutput` event.
     pub writer_version: u64,
     /// Monotonic version counter for Critic content — bumped on each `CriticOutput` event.
     pub critic_version: u64,
     /// Which pane currently has keyboard focus (highlighted border).
     pub focused_pane: FocusTarget,
+    /// Seconds remaining on the apology cooldown, if active.
+    ///
+    /// `Some(secs)` when the cooldown is in effect (shown in status bar);
+    /// `None` when the cooldown has expired or no apology has occurred yet.
+    pub apology_cooldown: Option<u64>,
 }
 
 impl App {
@@ -64,9 +75,13 @@ impl App {
             error: None,
             cost_spent: 0.0,
             cost_limit: 0.0,
+            writer_cost: 0.0,
+            critic_cost: 0.0,
+            apology_cost: 0.0,
             writer_version: 0,
             critic_version: 0,
             focused_pane: FocusTarget::default(),
+            apology_cooldown: None,
         }
     }
 }
@@ -203,9 +218,13 @@ pub fn render(frame: &mut Frame, app: &App) {
         } else {
             String::new()
         };
+        let cooldown_info = match app.apology_cooldown {
+            Some(secs) if secs > 0 => format!(" | Apology cooldown: {secs}s"),
+            _ => String::new(),
+        };
         let status = format!(
-            "Running... | Cost: ${:.2}/${:.2}{version_info} | Esc to stop",
-            app.cost_spent, app.cost_limit,
+            "Running... | Cost: ${:.2}/${:.2}{version_info} | Writer: ${:.4} | Critic: ${:.4} | Apologies: ${:.4}{cooldown_info} | Esc to stop",
+            app.cost_spent, app.cost_limit, app.writer_cost, app.critic_cost, app.apology_cost,
         );
         let status_paragraph = Paragraph::new(status)
             .block(Block::default().title("Penance").borders(Borders::ALL))
