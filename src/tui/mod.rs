@@ -3,6 +3,7 @@ pub mod pane;
 pub mod ui;
 
 use std::io::{self, BufWriter, Stdout};
+use std::time::{Duration, Instant};
 
 use crossterm::{
     cursor,
@@ -65,6 +66,7 @@ pub struct Tui {
     terminal: Terminal<CrosstermBackend<BufWriter<Stdout>>>,
     cancel_token: CancellationToken,
     state: AppState,
+    stopping_since: Option<Instant>,
 }
 
 impl Tui {
@@ -92,6 +94,7 @@ impl Tui {
                 terminal,
                 cancel_token,
                 state: AppState::Idle,
+                stopping_since: None,
             },
             TerminalGuard,
         ))
@@ -130,13 +133,16 @@ impl Tui {
                         }
                     }
                 }
-                maybe_event = reader.next() => {
+                    maybe_event = reader.next() => {
                     if let Some(Ok(Event::Key(key))) = maybe_event {
                         match input::handle_key(&mut app, key) {
                             input::ControlFlow::Stop => {
                                 self.cancel_token.cancel();
                                 app.state = AppState::Stopping;
                                 self.state = AppState::Stopping;
+                                if self.stopping_since.is_none() {
+                                    self.stopping_since = Some(Instant::now());
+                                }
                             }
                             input::ControlFlow::Quit => {
                                 self.cancel_token.cancel();
@@ -151,11 +157,27 @@ impl Tui {
                 _ = self.cancel_token.cancelled() => {
                     app.state = AppState::Stopping;
                     self.state = AppState::Stopping;
+                    if self.stopping_since.is_none() {
+                        self.stopping_since = Some(Instant::now());
+                    }
                 }
             }
 
             if app.state == AppState::Done {
                 break;
+            }
+
+            // Stopping timeout guard — prevents the TUI from spinning
+            // indefinitely if Shutdown never arrives.
+            const STOPPING_TIMEOUT_SECS: u64 = 10;
+            if self.state == AppState::Stopping {
+                if let Some(since) = self.stopping_since {
+                    if since.elapsed() > Duration::from_secs(STOPPING_TIMEOUT_SECS) {
+                        app.state = AppState::Done;
+                        self.state = AppState::Done;
+                        break;
+                    }
+                }
             }
 
             self.terminal

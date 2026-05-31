@@ -49,8 +49,10 @@ pub async fn run_spectacle(
     let writer_client = build_llm_client(&config)?;
     let critic_client = build_critic_client(&config)?;
 
-    // Writer task
-    {
+    // ── Spawn concurrent Writer + Critic loops ───────────────────────
+    // JoinHandles are retained so we can await graceful shutdown.
+
+    let writer_handle = {
         let writer_event_tx = event_tx.clone();
         let writer_state = state.clone();
         let writer_cancel = cancel_token.clone();
@@ -59,11 +61,10 @@ pub async fn run_spectacle(
         tokio::spawn(async move {
             writer_loop(writer_client, writer_state, writer_event_tx, writer_cancel, writer_config)
                 .await;
-        });
-    }
+        })
+    };
 
-    // Critic task
-    {
+    let critic_handle = {
         let critic_event_tx = event_tx.clone();
         let critic_state = state.clone();
         let critic_cancel = cancel_token.clone();
@@ -72,12 +73,74 @@ pub async fn run_spectacle(
         tokio::spawn(async move {
             critic_loop(critic_client, critic_state, critic_event_tx, critic_cancel, critic_config)
                 .await;
-        });
-    }
+        })
+    };
+
+    // ── Wait for cancellation (Esc / q in TUI) ──────────────────────
 
     cancel_token.cancelled().await;
 
+    // Notify TUI that shutdown has been initiated.
     let _ = event_tx.send(AppEvent::Shutdown);
+
+    // ── 3-tier subprocess shutdown ──────────────────────────────────
+    //
+    // Tier 1 (graceful, up to 3s): Both loops have already seen the
+    // cancelled token at their next checkpoint (`cancel_token.cancelled()`
+    // select branch or top-of-loop `is_cancelled()` check).  We give
+    // them 3 seconds to finish any in-progress LLM response processing
+    // and exit cleanly.
+    //
+    // Tier 2 (escalation): If the loops haven't returned within 3s,
+    // the timeout elapses.  Any in-flight `claude` subprocesses inside
+    // `anthropic_complete()` are bounded by their own `timeout_secs`.
+    // Once that expires, `child.kill().await` fires explicitly.
+    // The orchestrator returns anyway — `kill_on_drop(true)` on every
+    // subprocess `Command` provides the Tier 3 backstop when the
+    // tokio runtime drops at process exit.
+    //
+    // Tier 3 (panic backstop): `kill_on_drop(true)` on every
+    // `tokio::process::Command` ensures no orphan `claude` processes
+    // survive a panic or early return.
+
+    const SHUTDOWN_GRACE_SECS: u64 = 3;
+
+    let join_result = tokio::time::timeout(
+        Duration::from_secs(SHUTDOWN_GRACE_SECS),
+        async {
+            let writer_result = writer_handle.await;
+            let critic_result = critic_handle.await;
+            (writer_result, critic_result)
+        },
+    )
+    .await;
+
+    match join_result {
+        Ok((Ok(()), Ok(()))) => {
+            // Both loops exited cleanly — normal fast path.
+        }
+        Ok((Err(writer_join_err), _)) => {
+            eprintln!(
+                "Orchestrator: Writer loop panicked during shutdown: {writer_join_err}"
+            );
+        }
+        Ok((_, Err(critic_join_err))) => {
+            eprintln!(
+                "Orchestrator: Critic loop panicked during shutdown: {critic_join_err}"
+            );
+        }
+        Err(_elapsed) => {
+            // Tier 2 escalation: loops didn't exit within the grace period.
+            // In-flight LLM calls will be killed on timeout or by kill_on_drop.
+            eprintln!(
+                "Orchestrator: loops did not exit within {SHUTDOWN_GRACE_SECS}s grace period — escalating"
+            );
+        }
+    }
+
+    // Drop event_tx last — the TUI loop sees None from recv() after all
+    // senders are dropped, which transitions to Done if it hasn't already.
+    drop(event_tx);
 
     Ok(())
 }
