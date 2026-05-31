@@ -1,8 +1,10 @@
 pub mod input;
 pub mod pane;
+pub mod settings;
 pub mod ui;
 
 use std::io::{self, BufWriter, Stdout};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use crossterm::{
@@ -17,6 +19,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
 
 use crate::app::{AppEvent, AppState};
+use crate::config::{Config, RuntimeSettings};
 use crate::error::AppError;
 
 // ── Panic hook ────────────────────────────────────────────────────
@@ -121,12 +124,16 @@ impl Tui {
         mut event_rx: UnboundedReceiver<AppEvent>,
         task: String,
         reveal_step: usize,
+        runtime: Arc<RwLock<RuntimeSettings>>,
+        config: Arc<Config>,
     ) -> Result<(), AppError> {
         let mut reader = EventStream::new();
         let mut app = ui::App::new();
         app.state = AppState::Running;
         app.task = task;
         app.reveal_step = reveal_step.max(1);
+        app.runtime = runtime;
+        app.config = Some(config);
         self.state = AppState::Running;
 
         // ~8 fps animation tick driving the flame title. The frame counter,

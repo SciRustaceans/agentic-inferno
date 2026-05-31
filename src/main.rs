@@ -1,6 +1,6 @@
 use std::process::{ExitCode, Termination};
 
-use agentic_inferno::config::{CliArgs, Config, InfernoTask, TomlConfig};
+use agentic_inferno::config::{CliArgs, Config, InfernoTask, RuntimeSettings, TomlConfig};
 use agentic_inferno::error::AppError;
 use agentic_inferno::orchestrator;
 use agentic_inferno::state::SharedState;
@@ -84,8 +84,19 @@ async fn run_spectacle_app(config: Config, initial_content: String) -> Result<()
     // the configured reveal rate (cps / 8), floored at 1.
     let reveal_step = (config.reveal_cps() as usize / 8).max(1);
 
+    // Shared, mutable live settings. Seeded equal to `config`, so launch
+    // behaviour is unchanged; a later TUI settings menu mutates these and the
+    // agent loops re-read them each cycle.
+    let runtime = std::sync::Arc::new(std::sync::RwLock::new(RuntimeSettings::from_config(
+        &config,
+    )));
+
+    // Shared, read-only config for the TUI settings menu's model validation.
+    let config_arc = std::sync::Arc::new(config.clone());
+
     let spectacle_handle = tokio::spawn(orchestrator::run_spectacle(
         config.clone(),
+        runtime.clone(),
         state.clone(),
         event_tx,
         cancel_token.clone(),
@@ -93,7 +104,14 @@ async fn run_spectacle_app(config: Config, initial_content: String) -> Result<()
 
     install_panic_hook();
     let (mut tui, _guard) = Tui::enter(cancel_token.clone())?;
-    tui.run(event_rx, task_label, reveal_step).await?;
+    tui.run(
+        event_rx,
+        task_label,
+        reveal_step,
+        runtime.clone(),
+        config_arc,
+    )
+    .await?;
     Tui::exit()?;
 
     spectacle_handle

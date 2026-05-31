@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::error::AppError;
@@ -8,9 +8,13 @@ use crate::error::AppError;
 /// Cost ceiling guard — tracks cumulative LLM spend and rejects once the limit is hit.
 ///
 /// Only successful calls count. The limit is the maximum total spend in USD.
+///
+/// The limit is stored as an [`AtomicU64`] holding the `f64::to_bits`
+/// representation, so it can be updated live (e.g. from a TUI settings menu)
+/// without a second mutex while the hot-path `record()` keeps a single lock.
 pub struct CostCeiling {
     spent: Mutex<f64>,
-    limit: f64,
+    limit: AtomicU64,
 }
 
 impl CostCeiling {
@@ -26,7 +30,7 @@ impl CostCeiling {
         );
         Self {
             spent: Mutex::new(0.0),
-            limit,
+            limit: AtomicU64::new(limit.to_bits()),
         }
     }
 
@@ -35,10 +39,11 @@ impl CostCeiling {
     /// Returns `Err(AppError::CostCeilingExceeded)` if the addition would exceed the limit.
     /// The cost is not recorded on error — only successful calls count.
     pub fn record(&self, cost: f64) -> Result<(), AppError> {
+        let limit = self.limit();
         let mut spent = self.spent.lock().expect("CostCeiling mutex poisoned");
         let new_total = *spent + cost;
-        if new_total > self.limit {
-            return Err(AppError::CostCeilingExceeded(new_total, self.limit));
+        if new_total > limit {
+            return Err(AppError::CostCeilingExceeded(new_total, limit));
         }
         *spent = new_total;
         Ok(())
@@ -51,7 +56,16 @@ impl CostCeiling {
 
     /// Return the spend limit.
     pub fn limit(&self) -> f64 {
-        self.limit
+        f64::from_bits(self.limit.load(Ordering::Relaxed))
+    }
+
+    /// Update the spend limit live (e.g. from a settings menu).
+    ///
+    /// Lock-free — stores the new limit's bit pattern atomically. Raising the
+    /// limit allows spends that previously errored; lowering it tightens the
+    /// threshold `record()` enforces on the next call.
+    pub fn set_limit(&self, new: f64) {
+        self.limit.store(new.to_bits(), Ordering::Relaxed);
     }
 }
 
@@ -223,6 +237,30 @@ mod tests {
         assert!(matches!(err, AppError::CostCeilingExceeded(6.0, 5.0)));
         // The failed call should NOT have been recorded:
         assert_eq!(c.spent(), 3.0);
+    }
+
+    #[test]
+    fn test_cost_ceiling_set_limit_raise_and_lower() {
+        let c = CostCeiling::new(5.0);
+        assert_eq!(c.limit(), 5.0);
+
+        // A spend over the original cap errors.
+        assert!(c.record(6.0).is_err());
+        assert_eq!(c.spent(), 0.0);
+
+        // Raise the cap — the same spend now succeeds.
+        c.set_limit(10.0);
+        assert_eq!(c.limit(), 10.0);
+        assert!(c.record(6.0).is_ok());
+        assert_eq!(c.spent(), 6.0);
+
+        // Lower the cap below the next would-be total — it tightens immediately.
+        c.set_limit(7.0);
+        assert_eq!(c.limit(), 7.0);
+        let err = c.record(2.0).unwrap_err();
+        assert!(matches!(err, AppError::CostCeilingExceeded(8.0, 7.0)));
+        // Already-spent total is unchanged on the rejected call.
+        assert_eq!(c.spent(), 6.0);
     }
 
     #[test]

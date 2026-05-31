@@ -603,6 +603,67 @@ impl Config {
 }
 
 // ---------------------------------------------------------------------------
+// RuntimeSettings
+// ---------------------------------------------------------------------------
+
+/// The subset of configuration that can change live while the spectacle runs.
+///
+/// Wrapped in `Arc<RwLock<RuntimeSettings>>` and re-read by the Writer and
+/// Critic loops at the top of each cycle, so a TUI settings menu can change
+/// these six fields mid-run.
+#[derive(Clone, Debug)]
+pub struct RuntimeSettings {
+    /// Model name for the writer agent.
+    pub writer_model: String,
+    /// Model name for the critic agent.
+    pub critic_model: String,
+    /// Critic personality style.
+    pub critic_style: CriticStyle,
+    /// Typewriter reveal speed for the panes.
+    pub speed: Speed,
+    /// Free-form prompt for `InfernoTask::Prompt` mode (None otherwise).
+    pub prompt: Option<String>,
+    /// Maximum total cost in USD.
+    pub max_cost_usd: f64,
+}
+
+impl Default for RuntimeSettings {
+    /// Sensible launch defaults used when no `Config` is available (e.g. the
+    /// argument-less `App::new()` in tests). `Tui::run` overwrites these with
+    /// the real `RuntimeSettings::from_config(..)` before the loop starts.
+    ///
+    /// Hand-written (not derived) so `max_cost_usd` defaults to `2.0` rather
+    /// than `0.0` — a zero ceiling would stop the run on the first cycle.
+    fn default() -> Self {
+        Self {
+            writer_model: String::new(),
+            critic_model: String::new(),
+            critic_style: CriticStyle::Random,
+            speed: Speed::Normal,
+            prompt: None,
+            max_cost_usd: 2.0,
+        }
+    }
+}
+
+impl RuntimeSettings {
+    /// Build the live settings snapshot from the resolved [`Config`].
+    ///
+    /// The six live fields start equal to the config values, so behaviour at
+    /// launch is identical to the startup-only configuration.
+    pub fn from_config(c: &Config) -> Self {
+        Self {
+            writer_model: c.writer_model.clone(),
+            critic_model: c.critic_model.clone(),
+            critic_style: c.critic_style,
+            speed: c.speed,
+            prompt: c.prompt.clone(),
+            max_cost_usd: c.max_cost_usd,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -980,6 +1041,28 @@ openai_base_url = "https://custom.openai.com"
         // Default (Writing) task with no input and no prompt must require input.
         let err = build_test_config(|c| c.input = None).unwrap_err();
         assert!(matches!(&err, AppError::MissingInput), "got {err:?}");
+    }
+
+    // -- RuntimeSettings --
+
+    #[test]
+    fn test_runtime_settings_from_config_copies_six_fields() {
+        let cfg = build_test_config(|c| {
+            c.writer_model = "deepseek-reasoner".into();
+            c.critic_model = Some("deepseek-chat".into());
+            c.critic_style = Some(CriticStyle::AcademicSnob);
+            c.speed = Some(Speed::Fast);
+            c.max_cost_usd = Some(3.5);
+        })
+        .expect("build should succeed");
+
+        let rs = RuntimeSettings::from_config(&cfg);
+        assert_eq!(rs.writer_model, "deepseek-reasoner");
+        assert_eq!(rs.critic_model, "deepseek-chat");
+        assert_eq!(rs.critic_style, CriticStyle::AcademicSnob);
+        assert_eq!(rs.speed, Speed::Fast);
+        assert_eq!(rs.prompt, cfg.prompt);
+        assert_eq!(rs.max_cost_usd, 3.5);
     }
 
     #[test]

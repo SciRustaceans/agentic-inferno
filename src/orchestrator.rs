@@ -1,12 +1,12 @@
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 use crate::app::AppEvent;
-use crate::config::{Config, InfernoTask};
+use crate::config::{Config, InfernoTask, RuntimeSettings};
 use crate::error::AppError;
 use crate::guards::{semantic_hash, CostCeiling, LoopDetection};
 use crate::prompts::{self, APOLOGY_SYSTEM_PROMPT};
@@ -119,6 +119,7 @@ fn estimate_model_context_window(model: &str) -> usize {
 /// 6. Send `AppEvent::Shutdown` to the TUI.
 pub async fn run_spectacle(
     config: Config,
+    runtime: Arc<RwLock<RuntimeSettings>>,
     state: SharedState,
     event_tx: UnboundedSender<AppEvent>,
     cancel_token: CancellationToken,
@@ -168,6 +169,7 @@ pub async fn run_spectacle(
         let writer_ac = Arc::clone(&writer_cost);
         let writer_ld = Arc::clone(&loop_detector);
         let writer_tt = Arc::clone(&token_totals);
+        let writer_runtime = Arc::clone(&runtime);
 
         tokio::spawn(async move {
             writer_loop(
@@ -176,6 +178,7 @@ pub async fn run_spectacle(
                 writer_event_tx,
                 writer_cancel,
                 writer_config,
+                writer_runtime,
                 writer_cc,
                 writer_ac,
                 writer_ld,
@@ -193,6 +196,7 @@ pub async fn run_spectacle(
         let critic_cc = Arc::clone(&cost_ceiling);
         let critic_ac = Arc::clone(&critic_cost);
         let critic_tt = Arc::clone(&token_totals);
+        let critic_runtime = Arc::clone(&runtime);
 
         tokio::spawn(async move {
             critic_loop(
@@ -201,6 +205,7 @@ pub async fn run_spectacle(
                 critic_event_tx,
                 critic_cancel,
                 critic_config,
+                critic_runtime,
                 critic_cc,
                 critic_ac,
                 critic_tt,
@@ -350,25 +355,56 @@ fn record_and_emit_tokens(
 
 #[allow(clippy::too_many_arguments)]
 async fn writer_loop(
-    client: LlmClient,
+    mut client: LlmClient,
     state: SharedState,
     event_tx: UnboundedSender<AppEvent>,
     cancel_token: CancellationToken,
     config: Config,
+    runtime: Arc<RwLock<RuntimeSettings>>,
     cost_ceiling: Arc<CostCeiling>,
     writer_cost: Arc<Mutex<f64>>,
     loop_detector: Arc<Mutex<LoopDetection>>,
     token_totals: Arc<Mutex<TokenTotals>>,
 ) {
     // ── Context window management ─────────────────────────────────────────
+    // `task` is fixed for the run, so the system prompt and model context
+    // window are computed once. The model can change live, but model-window
+    // staleness after a switch is out of scope.
     let model_context_window = estimate_model_context_window(&config.writer_model);
     let writer_system_prompt = prompts::writer_system(config.task);
     let mut critique_history: VecDeque<(String, usize)> = VecDeque::new();
-    let reveal_cps = config.reveal_cps();
+    // Track the model the current client was built with so a live change
+    // triggers a rebuild.
+    let mut current_model = config.writer_model.clone();
 
     loop {
         if cancel_token.is_cancelled() {
             break;
+        }
+
+        // ── Re-read live settings (copy out, drop the guard before .await) ──
+        let (want_model, speed, prompt, cap) = {
+            let s = runtime.read().expect("runtime settings RwLock poisoned");
+            (
+                s.writer_model.clone(),
+                s.speed,
+                s.prompt.clone(),
+                s.max_cost_usd,
+            )
+        };
+        let reveal_cps = speed.cps();
+        cost_ceiling.set_limit(cap);
+
+        if want_model != current_model {
+            match build_client(&want_model, "Writer", &config) {
+                Ok(c) => {
+                    client = c;
+                    current_model = want_model;
+                }
+                Err(e) => {
+                    let _ = event_tx.send(AppEvent::Error(e));
+                }
+            }
         }
 
         // Char count of the most recent reply, used to pace the next cycle so
@@ -376,15 +412,13 @@ async fn writer_loop(
         // the dwell floors at CYCLE_SLEEP_MS.
         let mut last_reply_chars = 0usize;
 
-        let (current_version, current_content) = state.snapshot();
+        let (_current_version, current_content) = state.snapshot();
 
         // ── Collect latest critique into history ──────────────────────────
-        if let Some((critique_version, critique_text)) = state.read_critique() {
-            if critique_version != current_version {
-                eprintln!(
-                    "Writer: critique version {critique_version} is stale (document at {current_version}), applying anyway",
-                );
-            }
+        if let Some((_critique_version, critique_text)) = state.read_critique() {
+            // A stale critique (its version differs from the current document)
+            // is still incorporated — the Writer keeps moving forward.
+            //
             // Only add to history if it's actually new text (avoid duplicating
             // the same critique across fast Writer cycles).
             let is_new = critique_history
@@ -405,16 +439,9 @@ async fn writer_loop(
 
         let pct = current_estimate as f64 / model_context_window as f64;
         if pct > 0.90 {
-            if let Some((_dropped_text, dropped_tokens)) = critique_history.pop_front() {
-                eprintln!(
-                    "Writer: context window at {pct:.1}% ({current_estimate}/{model_context_window}) \
-                     — dropping oldest critique ({dropped_tokens} tokens)",
-                );
-            }
-        } else if pct > 0.80 {
-            eprintln!(
-                "Writer: context window at {pct:.1}% ({current_estimate}/{model_context_window})",
-            );
+            // At 90% the oldest critique is pruned to keep the prompt within the
+            // model's context window.
+            let _ = critique_history.pop_front();
         }
 
         // ── Build prompt with full critique history ───────────────────────
@@ -429,10 +456,11 @@ async fn writer_loop(
 
         // In prompt mode the user message frames the prompt as the goal and the
         // shared document as the evolving attempt. Other tasks pass the document
-        // itself as the thing being revised.
-        let prompt_text = match (config.task, config.prompt.as_deref()) {
-            (InfernoTask::Prompt, Some(prompt)) => format!(
-                "Task: {prompt}\n\nCurrent attempt:\n{current_content}\n\nKeep working on it.{critique_context}"
+        // itself as the thing being revised. The prompt text is re-read live from
+        // settings each cycle.
+        let prompt_text = match (config.task, prompt.as_deref()) {
+            (InfernoTask::Prompt, Some(goal)) => format!(
+                "Task: {goal}\n\nCurrent attempt:\n{current_content}\n\nKeep working on it.{critique_context}"
             ),
             _ => format!("{current_content}{critique_context}"),
         };
@@ -445,7 +473,7 @@ async fn writer_loop(
         let request = ChatRequest {
             system: writer_system_prompt.to_string(),
             user: prompt_text,
-            model: config.writer_model.clone(),
+            model: current_model.clone(),
             temperature: config.temperature as f32,
             max_tokens: config.max_tokens,
         };
@@ -465,11 +493,6 @@ async fn writer_loop(
                 if let Some(cost) = reply.cost_usd {
                     // Track per-agent cost (only on success).
                     *writer_cost.lock().expect("writer_cost mutex poisoned") += cost;
-
-                    eprintln!(
-                        "Writer: cycle cost ${cost:.6}, writer total ${:.6}",
-                        *writer_cost.lock().expect("writer_cost mutex poisoned"),
-                    );
 
                     // Enforce cost ceiling. If exceeded, cancel and exit.
                     if let Err(AppError::CostCeilingExceeded(spent, limit)) =
@@ -501,14 +524,14 @@ async fn writer_loop(
 
                     // Semantic loop detection on the document content.
                     let text_hash = semantic_hash(&document_text);
-                    if let Err(err) = loop_detector
+                    if loop_detector
                         .lock()
                         .expect("LoopDetection mutex poisoned")
                         .check(text_hash)
+                        .is_err()
                     {
                         let _ = event_tx.send(AppEvent::LoopExhausted);
                         cancel_token.cancel();
-                        eprintln!("Writer: loop exhausted — {err}");
                         break;
                     }
 
@@ -531,13 +554,12 @@ async fn writer_loop(
                         let apology_config = config.clone();
                         let apology_ceiling = Arc::clone(&cost_ceiling);
                         let apology_tt = Arc::clone(&token_totals);
+                        // Use the Writer's currently-active model (which may have
+                        // been switched live) for the apology call.
+                        let apology_model = current_model.clone();
 
                         tokio::spawn(async move {
-                            match build_client(
-                                &apology_config.writer_model,
-                                "Apology",
-                                &apology_config,
-                            ) {
+                            match build_client(&apology_model, "Apology", &apology_config) {
                                 Ok(client) => {
                                     let critique_text = apology_state
                                         .read_critique()
@@ -549,7 +571,7 @@ async fn writer_loop(
                                     let request = ChatRequest {
                                         system: APOLOGY_SYSTEM_PROMPT.to_string(),
                                         user: critique_text,
-                                        model: apology_config.writer_model.clone(),
+                                        model: apology_model.clone(),
                                         temperature: apology_config.temperature as f32,
                                         max_tokens: apology_config.max_tokens,
                                     };
@@ -600,19 +622,18 @@ async fn writer_loop(
                         });
                     }
 
-                    eprintln!("Apology triggered: marker (apology follows marker in text)");
                     new_ver
                 } else {
                     // Semantic loop detection on the document content.
                     let text_hash = semantic_hash(&reply.text);
-                    if let Err(err) = loop_detector
+                    if loop_detector
                         .lock()
                         .expect("LoopDetection mutex poisoned")
                         .check(text_hash)
+                        .is_err()
                     {
                         let _ = event_tx.send(AppEvent::LoopExhausted);
                         cancel_token.cancel();
-                        eprintln!("Writer: loop exhausted — {err}");
                         break;
                     }
 
@@ -667,20 +688,48 @@ async fn writer_loop(
 /// Same `tokio::select!` pattern as the Writer loop — responds within ~500ms.
 #[allow(clippy::too_many_arguments)]
 async fn critic_loop(
-    client: LlmClient,
+    mut client: LlmClient,
     state: SharedState,
     event_tx: UnboundedSender<AppEvent>,
     cancel_token: CancellationToken,
     config: Config,
+    runtime: Arc<RwLock<RuntimeSettings>>,
     cost_ceiling: Arc<CostCeiling>,
     critic_cost: Arc<Mutex<f64>>,
     token_totals: Arc<Mutex<TokenTotals>>,
 ) {
-    let reveal_cps = config.reveal_cps();
+    // Track the model the current client was built with so a live change
+    // triggers a rebuild.
+    let mut current_model = config.critic_model.clone();
 
     loop {
         if cancel_token.is_cancelled() {
             break;
+        }
+
+        // ── Re-read live settings (copy out, drop the guard before .await) ──
+        let (want_model, style, speed, cap) = {
+            let s = runtime.read().expect("runtime settings RwLock poisoned");
+            (
+                s.critic_model.clone(),
+                s.critic_style,
+                s.speed,
+                s.max_cost_usd,
+            )
+        };
+        let reveal_cps = speed.cps();
+        cost_ceiling.set_limit(cap);
+
+        if want_model != current_model {
+            match build_client(&want_model, "Critic", &config) {
+                Ok(c) => {
+                    client = c;
+                    current_model = want_model;
+                }
+                Err(e) => {
+                    let _ = event_tx.send(AppEvent::Error(e));
+                }
+            }
         }
 
         // Char count of the most recent reply, used to pace the next cycle so
@@ -690,7 +739,7 @@ async fn critic_loop(
 
         let (doc_version, doc_content) = state.snapshot();
 
-        let critic_system = prompts::critics(config.critic_style).to_string();
+        let critic_system = prompts::critics(style).to_string();
 
         // Pre-compute the user-side estimate before `doc_content` is moved.
         let user_est = estimate_tokens(&doc_content) as u64;
@@ -698,7 +747,7 @@ async fn critic_loop(
         let request = ChatRequest {
             system: critic_system,
             user: doc_content,
-            model: config.critic_model.clone(),
+            model: current_model.clone(),
             temperature: config.temperature as f32,
             max_tokens: config.max_tokens,
         };
@@ -716,11 +765,6 @@ async fn critic_loop(
                 if let Some(cost) = reply.cost_usd {
                     // Track per-agent cost (only on success).
                     *critic_cost.lock().expect("critic_cost mutex poisoned") += cost;
-
-                    eprintln!(
-                        "Critic: cycle cost ${cost:.6}, critic total ${:.6}",
-                        *critic_cost.lock().expect("critic_cost mutex poisoned"),
-                    );
 
                     // Enforce cost ceiling. If exceeded, cancel and exit.
                     if let Err(AppError::CostCeilingExceeded(spent, limit)) =
@@ -748,7 +792,6 @@ async fn critic_loop(
                 let kw_count = count_harsh_keywords(&reply.text);
                 if kw_count >= 3 {
                     let _ = event_tx.send(AppEvent::ApologyTriggered);
-                    eprintln!("Apology triggered: keywords ({kw_count})");
                 }
 
                 state.write_critique(doc_version, reply.text.clone());
@@ -795,7 +838,11 @@ fn build_critic_client(config: &Config) -> Result<LlmClient, AppError> {
 /// Detects the provider from the model name, reads the API key from the
 /// environment, resolves the base URL (config override → env var → default),
 /// and constructs the appropriate client variant.
-fn build_client(model: &str, agent_name: &str, config: &Config) -> Result<LlmClient, AppError> {
+pub(crate) fn build_client(
+    model: &str,
+    agent_name: &str,
+    config: &Config,
+) -> Result<LlmClient, AppError> {
     let (provider, model_name) = detect_provider(model, agent_name)?;
 
     match provider {
@@ -823,6 +870,20 @@ fn build_client(model: &str, agent_name: &str, config: &Config) -> Result<LlmCli
             })
         }
     }
+}
+
+/// Validate that a model string can be turned into a working [`LlmClient`].
+///
+/// Reuses [`build_client`] so it honors every per-provider rule (e.g. the
+/// Anthropic CLI path needs no API key, while OpenAI-compatible providers do).
+/// The built client is discarded — only success/failure matters. Intended for
+/// a settings menu to pre-validate a model change before applying it.
+pub(crate) fn validate_model(
+    model: &str,
+    agent_name: &str,
+    config: &Config,
+) -> Result<(), AppError> {
+    build_client(model, agent_name, config).map(|_| ())
 }
 
 /// Resolve the base URL for an OpenAI-compatible provider.
@@ -898,6 +959,79 @@ pub fn count_harsh_keywords(text: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{CliArgs, Config};
+    use std::sync::Mutex as StdMutex;
+
+    /// Serialise the env-var window so parallel tests don't clobber the key.
+    static ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    /// Build a minimal validated `Config` for in-crate orchestrator tests.
+    /// Creates a temp input file outside any repo so the leak guard passes and
+    /// sets a dummy `DEEPSEEK_API_KEY` for the duration of the build.
+    ///
+    /// Callers must already hold `ENV_LOCK` — this helper does not acquire it
+    /// (the `std::sync::Mutex` is non-reentrant, so a second lock on the same
+    /// thread would deadlock).
+    fn test_config() -> Config {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let input_path = tmp.path().join("input.txt");
+        std::fs::write(&input_path, "content").expect("write input");
+
+        unsafe {
+            std::env::set_var("DEEPSEEK_API_KEY", "sk-test-fake-key");
+        }
+
+        let cli = CliArgs {
+            writer_model: "deepseek-reasoner".into(),
+            critic_model: Some("deepseek-chat".into()),
+            input: Some(input_path),
+            task: None,
+            prompt: None,
+            max_cost_usd: Some(1.0),
+            temperature: Some(0.8),
+            max_tokens: Some(256),
+            timeout_secs: Some(10),
+            config: None,
+            critic_style: None,
+            speed: None,
+            openai_base_url: None,
+            deepseek_base_url: None,
+            moonshot_base_url: None,
+        };
+
+        let config = Config::build(cli, None).expect("config build");
+
+        unsafe {
+            std::env::remove_var("DEEPSEEK_API_KEY");
+        }
+        let _ = tmp;
+        config
+    }
+
+    #[test]
+    fn validate_model_accepts_known_model_with_key() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let config = test_config();
+        unsafe {
+            std::env::set_var("DEEPSEEK_API_KEY", "sk-test-fake-key");
+        }
+        let ok = validate_model("deepseek-chat", "Critic", &config);
+        unsafe {
+            std::env::remove_var("DEEPSEEK_API_KEY");
+        }
+        assert!(ok.is_ok(), "deepseek-chat with key should validate: {ok:?}");
+    }
+
+    #[test]
+    fn validate_model_rejects_unknown_model() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let config = test_config();
+        let err = validate_model("nonexistent-model-xyz", "Writer", &config);
+        assert!(
+            matches!(err, Err(AppError::UnknownModel(_, _))),
+            "unknown model should fail with UnknownModel, got {err:?}"
+        );
+    }
 
     #[test]
     fn reveal_dwell_ms_grows_with_length() {

@@ -36,10 +36,24 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> ControlFlow {
         return ControlFlow::Continue;
     }
 
+    // Ctrl+C is a hard quit that always wins, even with the menu open.
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return ControlFlow::Quit;
+    }
+
+    // While the settings menu is open it captures every other key (Esc closes
+    // the menu rather than stopping the app; typing/q must not stop it).
+    if app.settings.open {
+        return crate::tui::settings::handle_menu_key(app, key);
+    }
+
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => ControlFlow::Stop,
 
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => ControlFlow::Quit,
+        KeyCode::Char('s') => {
+            crate::tui::settings::open_menu(app);
+            ControlFlow::Continue
+        }
 
         KeyCode::Tab => {
             app.focused_pane = match app.focused_pane {

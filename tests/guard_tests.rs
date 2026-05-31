@@ -35,6 +35,29 @@ fn test_cost_ceiling_only_successful_calls_count() {
     assert_eq!(c.spent(), 3.0);
 }
 
+#[test]
+fn test_cost_ceiling_set_limit_changes_threshold() {
+    let c = CostCeiling::new(5.0);
+    assert_eq!(c.limit(), 5.0);
+
+    // Raising the cap allows a spend that previously errored.
+    assert!(c.record(6.0).is_err());
+    c.set_limit(10.0);
+    assert_eq!(c.limit(), 10.0);
+    assert!(c.record(6.0).is_ok());
+    assert_eq!(c.spent(), 6.0);
+
+    // Lowering the cap tightens the threshold record() enforces.
+    c.set_limit(7.0);
+    assert_eq!(c.limit(), 7.0);
+    let err = c.record(2.0).unwrap_err();
+    assert!(
+        matches!(err, AppError::CostCeilingExceeded(8.0, 7.0)),
+        "expected CostCeilingExceeded(8.0, 7.0), got {err:?}"
+    );
+    assert_eq!(c.spent(), 6.0);
+}
+
 // ── LoopDetection ────────────────────────────────────────────────
 
 #[test]

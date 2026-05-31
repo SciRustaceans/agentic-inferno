@@ -8,7 +8,7 @@
 //! and event-channel collection.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
@@ -18,9 +18,15 @@ use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use agentic_inferno::app::AppEvent;
-use agentic_inferno::config::{CliArgs, Config};
+use agentic_inferno::config::{CliArgs, Config, RuntimeSettings};
 use agentic_inferno::orchestrator::run_spectacle;
 use agentic_inferno::state::SharedState;
+
+/// Wrap a `Config`'s live fields in the shared `Arc<RwLock<RuntimeSettings>>`
+/// the orchestrator now requires.
+fn runtime_from(config: &Config) -> Arc<RwLock<RuntimeSettings>> {
+    Arc::new(RwLock::new(RuntimeSettings::from_config(config)))
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -206,9 +212,10 @@ async fn test_writer_and_critic_produce_output_within_10s() {
 
     let handle = {
         let config = config.clone();
+        let runtime = runtime_from(&config);
         let cancel = cancel_token.clone();
         tokio::spawn(async move {
-            run_spectacle(config, state, event_tx, cancel)
+            run_spectacle(config, runtime, state, event_tx, cancel)
                 .await
                 .expect("run_spectacle should not error")
         })
@@ -259,9 +266,10 @@ async fn test_version_stamping_writer_increments_critic_snapshots() {
 
     let handle = {
         let config = config.clone();
+        let runtime = runtime_from(&config);
         let cancel = cancel_token.clone();
         tokio::spawn(async move {
-            run_spectacle(config, state, event_tx, cancel)
+            run_spectacle(config, runtime, state, event_tx, cancel)
                 .await
                 .expect("run_spectacle should not error")
         })
@@ -381,10 +389,11 @@ async fn test_stale_critique_warning_no_crash() {
 
     let handle = {
         let config = config.clone();
+        let runtime = runtime_from(&config);
         let cancel = cancel_token.clone();
         let state = state.clone();
         tokio::spawn(async move {
-            run_spectacle(config, state, event_tx, cancel)
+            run_spectacle(config, runtime, state, event_tx, cancel)
                 .await
                 .expect("run_spectacle should not error")
         })
@@ -455,9 +464,10 @@ async fn test_stop_mechanism_loops_exit_promptly() {
     let start = Instant::now();
     let handle = {
         let config = config.clone();
+        let runtime = runtime_from(&config);
         let cancel = cancel_token.clone();
         tokio::spawn(async move {
-            run_spectacle(config, state, event_tx, cancel)
+            run_spectacle(config, runtime, state, event_tx, cancel)
                 .await
                 .expect("run_spectacle should not error")
         })
@@ -547,9 +557,10 @@ async fn test_writer_error_does_not_crash_critic() {
 
     let handle = {
         let config = config.clone();
+        let runtime = runtime_from(&config);
         let cancel = cancel_token.clone();
         tokio::spawn(async move {
-            run_spectacle(config, state, event_tx, cancel)
+            run_spectacle(config, runtime, state, event_tx, cancel)
                 .await
                 .expect("run_spectacle should not error")
         })
@@ -645,9 +656,10 @@ async fn test_critic_error_does_not_crash_writer() {
 
     let handle = {
         let config = config.clone();
+        let runtime = runtime_from(&config);
         let cancel = cancel_token.clone();
         tokio::spawn(async move {
-            run_spectacle(config, state, event_tx, cancel)
+            run_spectacle(config, runtime, state, event_tx, cancel)
                 .await
                 .expect("run_spectacle should not error")
         })
@@ -716,10 +728,11 @@ async fn test_shared_state_snapshot_and_update_interactions() {
 
     let handle = {
         let config = config.clone();
+        let runtime = runtime_from(&config);
         let cancel = cancel_token.clone();
         let state = state.clone();
         tokio::spawn(async move {
-            run_spectacle(config, state, event_tx, cancel)
+            run_spectacle(config, runtime, state, event_tx, cancel)
                 .await
                 .expect("run_spectacle should not error")
         })
@@ -796,10 +809,11 @@ async fn test_cancel_during_llm_call_no_corruption() {
 
     let handle = {
         let config = config.clone();
+        let runtime = runtime_from(&config);
         let cancel = cancel_token.clone();
         let state = state.clone();
         tokio::spawn(async move {
-            run_spectacle(config, state, event_tx, cancel)
+            run_spectacle(config, runtime, state, event_tx, cancel)
                 .await
                 .expect("run_spectacle should not error")
         })

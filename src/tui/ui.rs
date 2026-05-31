@@ -9,8 +9,10 @@ use ratatui::{
 };
 
 use crate::app::AppState;
+use crate::config::{Config, RuntimeSettings};
 use crate::error::AppError;
 use crate::tui::pane::PaneBuffer;
+use crate::tui::settings::SettingsMenu;
 
 /// Which pane is currently focused for keyboard input.
 ///
@@ -94,6 +96,16 @@ pub struct App {
     /// Characters revealed per animation tick (the typewriter step). Derived
     /// from the configured reveal speed; set before the loop starts.
     pub reveal_step: usize,
+    /// Shared, mutable live settings the agent loops re-read each cycle. The
+    /// settings menu reads this on open and writes the staged draft on Enter.
+    pub runtime: Arc<RwLock<RuntimeSettings>>,
+    /// Read-only resolved config used to validate model changes from the menu.
+    ///
+    /// `None` in tests (so the menu applies without API-key validation);
+    /// `Some` once `Tui::run` wires in the real config.
+    pub config: Option<Arc<Config>>,
+    /// The live settings menu overlay state.
+    pub settings: SettingsMenu,
 }
 
 /// Maximum length of the accumulated Critic `critic_target`, in characters.
@@ -136,6 +148,9 @@ impl App {
             critic_target: String::new(),
             critic_revealed: 0,
             reveal_step: DEFAULT_REVEAL_STEP,
+            runtime: Arc::new(RwLock::new(RuntimeSettings::default())),
+            config: None,
+            settings: SettingsMenu::default(),
         }
     }
 }
@@ -325,12 +340,12 @@ fn flame_title_line(frame: u64) -> Line<'static> {
 // ── Big ASCII-art block title ──────────────────────────────────────
 
 /// Number of rows in the block font.
-const GLYPH_ROWS: usize = 5;
+const GLYPH_ROWS: usize = 7;
 
 /// Filled-cell character for the block font.
 const BLOCK: char = '█';
 
-/// Map a glyph to its 5-row block-font representation.
+/// Map a glyph to its 7-row block-font representation.
 ///
 /// Only the characters used in [`BANNER_TITLE`] ("AGENT INFERNO") plus space
 /// are covered. Unknown characters render as blank columns. Each row is a
@@ -341,33 +356,43 @@ fn glyph_rows(ch: char) -> [&'static str; GLYPH_ROWS] {
         'A' => [
             " ███ ",
             "█   █",
+            "█   █",
             "█████",
+            "█   █",
             "█   █",
             "█   █", //
         ],
         'G' => [
             " ████",
             "█    ",
+            "█    ",
             "█  ██",
+            "█   █",
             "█   █",
             " ████", //
         ],
         'E' => [
             "█████",
             "█    ",
-            "███  ",
+            "█    ",
+            "████ ",
+            "█    ",
             "█    ",
             "█████", //
         ],
         'N' => [
             "█   █",
             "██  █",
+            "██  █",
             "█ █ █",
+            "█  ██",
             "█  ██",
             "█   █", //
         ],
         'T' => [
             "█████",
+            "  █  ",
+            "  █  ",
             "  █  ",
             "  █  ",
             "  █  ",
@@ -378,20 +403,26 @@ fn glyph_rows(ch: char) -> [&'static str; GLYPH_ROWS] {
             " █ ",
             " █ ",
             " █ ",
+            " █ ",
+            " █ ",
             "███", //
         ],
         'F' => [
             "█████",
             "█    ",
-            "███  ",
+            "█    ",
+            "████ ",
+            "█    ",
             "█    ",
             "█    ", //
         ],
         'R' => [
             "████ ",
             "█   █",
+            "█   █",
             "████ ",
             "█  █ ",
+            "█   █",
             "█   █", //
         ],
         'O' => [
@@ -399,11 +430,13 @@ fn glyph_rows(ch: char) -> [&'static str; GLYPH_ROWS] {
             "█   █",
             "█   █",
             "█   █",
+            "█   █",
+            "█   █",
             " ███ ", //
         ],
         // Space (word gap) — a few blank columns.
         _ => [
-            "   ", "   ", "   ", "   ", "   ", //
+            "   ", "   ", "   ", "   ", "   ", "   ", "   ", //
         ],
     }
 }
@@ -484,21 +517,25 @@ fn flame_row(width: u16, frame: u64, phase: u64) -> Line<'static> {
 }
 
 /// Format the token-meter line shown beneath the flame title.
-fn token_meter_line(app: &App) -> String {
+///
+/// Abbreviated (`W`/`C`/`A` rather than `Writer`/`Critic`/`Apology`) so the
+/// line stays short as token counts grow into five digits — the banner does not
+/// wrap, so a long line would otherwise truncate or split a word mid-render.
+pub(crate) fn token_meter_line(app: &App) -> String {
     let task = if app.task.is_empty() {
         String::new()
     } else {
-        format!("Task: {}    ", app.task)
+        format!("Task: {}   ", app.task)
     };
     format!(
-        "{task}Tokens: {}  (Writer {} · Critic {} · Apology {})",
+        "{task}Tokens {}  (W {} · C {} · A {})",
         app.total_tokens, app.writer_tokens, app.critic_tokens, app.apology_tokens,
     )
 }
 
 /// Render the three-pane TUI layout into the given frame.
 ///
-/// Layout is a vertical split — top banner (11 rows of big ASCII art + flames
+/// Layout is a vertical split — top banner (13 rows of big ASCII art + flames
 /// on a wide terminal, else a 5-row compact flame title), main panes, status
 /// bar (3 rows) — then a horizontal split of the middle chunk (50% Writer, 50%
 /// Critic). When an apology is active (and no error), a centered popup is drawn
@@ -522,7 +559,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     // Adaptive banner: a wide/tall terminal gets the big ASCII-art title with
     // flame rows; otherwise the compact single-line flame title is used.
     let big = area.width >= 100 && area.height >= 30;
-    let banner_height: u16 = if big { 11 } else { 5 };
+    let banner_height: u16 = if big { 13 } else { 5 };
 
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -674,6 +711,11 @@ pub fn render(frame: &mut Frame, app: &App) {
             frame.render_widget(apology_paragraph, popup);
         }
     }
+
+    // ── Settings: centered overlay drawn LAST (on top of everything) ──
+    if app.settings.open {
+        crate::tui::settings::render_settings(frame, app, area);
+    }
 }
 
 /// Compute a horizontally and vertically centered `Rect` within `area`.
@@ -681,7 +723,7 @@ pub fn render(frame: &mut Frame, app: &App) {
 /// The result is `percent_x` percent of `area`'s width, and its height is
 /// `max_height` percent of `area`'s height, each floored at a few rows so the
 /// box always has a usable interior. Used to position the apology popup.
-fn centered_rect(percent_x: u16, percent_max_height: u16, area: Rect) -> Rect {
+pub(crate) fn centered_rect(percent_x: u16, percent_max_height: u16, area: Rect) -> Rect {
     let width = (area.width * percent_x / 100).max(20).min(area.width);
     let height = (area.height * percent_max_height / 100)
         .max(5)

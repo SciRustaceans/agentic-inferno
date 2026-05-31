@@ -769,12 +769,10 @@ fn test_render_banner_shows_per_agent_tokens() {
     app.total_tokens = 900;
     let buffer = render_app(&app, 120, 40);
     let text = buffer_text(&buffer);
-    assert!(text.contains("Writer 500"), "Writer tokens missing: {text}");
-    assert!(text.contains("Critic 300"), "Critic tokens missing: {text}");
-    assert!(
-        text.contains("Apology 100"),
-        "Apology tokens missing: {text}"
-    );
+    // Abbreviated to W/C/A (C2) so the meter stays short and never word-wraps.
+    assert!(text.contains("W 500"), "Writer tokens missing: {text}");
+    assert!(text.contains("C 300"), "Critic tokens missing: {text}");
+    assert!(text.contains("A 100"), "Apology tokens missing: {text}");
 }
 
 #[test]
@@ -1337,9 +1335,9 @@ fn test_render_big_banner_flames_animate_between_frames() {
     app.frame = 7;
     let buffer_b = render_app(&app, 120, 40);
 
-    // The big banner occupies the top 11 rows (Length(11)).
+    // The big banner occupies the top 13 rows (Length(13)).
     let area = *buffer_a.area();
-    let banner_h = 11.min(area.height);
+    let banner_h = 13.min(area.height);
     let mut differs = false;
     for y in 0..banner_h {
         for x in 0..area.width {
@@ -1373,19 +1371,19 @@ fn test_render_banner_shows_token_figure() {
     let buffer = render_app(&app, 120, 40);
     let text = buffer_text(&buffer);
     assert!(
-        text.contains("Tokens: 12300"),
+        text.contains("Tokens 12300"),
         "banner must show total token figure: {text}"
     );
     assert!(
-        text.contains("Writer 8100"),
+        text.contains("W 8100"),
         "banner must show writer tokens: {text}"
     );
     assert!(
-        text.contains("Critic 3200"),
+        text.contains("C 3200"),
         "banner must show critic tokens: {text}"
     );
     assert!(
-        text.contains("Apology 1000"),
+        text.contains("A 1000"),
         "banner must show apology tokens: {text}"
     );
     assert!(

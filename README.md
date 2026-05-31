@@ -216,6 +216,7 @@ Partial config files are fine. Anything you leave out falls through to defaults.
 |-----|--------|
 | `Esc` / `q` | Stop. Cancels in-flight requests and exits. |
 | `Ctrl+C` | Hard quit — immediate exit, no draining. |
+| `s` | Open the live settings menu (see below). |
 | `Tab` | Cycle focus between Writer (left) and Critic (right) panes. |
 | `Up` / `Down` | Scroll focused pane by 1 line. |
 | `PageUp` / `PageDown` | Scroll focused pane by 10 lines. |
@@ -223,6 +224,25 @@ Partial config files are fine. Anything you leave out falls through to defaults.
 | `End` | Jump to the bottom (latest content) of the focused pane. |
 
 The focused pane gets a yellow border. The unfocused Critic pane keeps a red one.
+
+### Settings menu
+
+Press **`s`** while running to open a centered settings overlay and change six
+parameters live, without restarting:
+
+- **Writer model** and **Critic model** — pick from a dropdown of common presets
+  or choose `Custom…` to type any model name.
+- **Critic tone** — the critic's personality (aggressive, theatrical, etc.).
+- **Speed** — the typewriter reveal pace (slow / normal / fast).
+- **Max cost** — the USD cost ceiling (stepped in $0.05 increments; it never
+  drops below what has already been spent).
+- **Prompt** — the free-form goal (prompt-mode runs only).
+
+Navigate with **↑ / ↓** to move between fields, **← / →** to change a dropdown or
+step the cost cap, and type to edit text fields (Prompt, or a `Custom…` model).
+Press **Enter** to apply — model changes are validated first, and the agent loops
+pick up the new settings on their next cycle. Press **Esc** to cancel and discard
+your changes.
 
 ## Architecture
 
