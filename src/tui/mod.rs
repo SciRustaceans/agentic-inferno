@@ -1,8 +1,12 @@
+pub mod input;
+pub mod pane;
+pub mod ui;
+
 use std::io::{self, BufWriter, Stdout};
 
 use crossterm::{
     cursor,
-    event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers},
+    event::{Event, EventStream},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -110,41 +114,52 @@ impl Tui {
         mut event_rx: UnboundedReceiver<AppEvent>,
     ) -> Result<(), AppError> {
         let mut reader = EventStream::new();
+        let mut app = ui::App::new();
+        app.state = AppState::Running;
         self.state = AppState::Running;
 
         loop {
             tokio::select! {
-                // Branch 1: App events from spawned tasks / orchestrator
                 event = event_rx.recv() => {
                     match event {
-                        Some(event) => self.handle_event(event),
+                        Some(event) => handle_app_event(&mut app, event),
                         None => {
-                            // All senders dropped — clean exit
+                            app.state = AppState::Done;
                             self.state = AppState::Done;
                             break;
                         }
                     }
                 }
-                // Branch 2: User key input via crossterm EventStream
                 maybe_event = reader.next() => {
                     if let Some(Ok(Event::Key(key))) = maybe_event {
-                        self.handle_key(key);
+                        match input::handle_key(&mut app, key) {
+                            input::ControlFlow::Stop => {
+                                self.cancel_token.cancel();
+                                app.state = AppState::Stopping;
+                                self.state = AppState::Stopping;
+                            }
+                            input::ControlFlow::Quit => {
+                                self.cancel_token.cancel();
+                                app.state = AppState::Done;
+                                self.state = AppState::Done;
+                                break;
+                            }
+                            input::ControlFlow::Continue => {}
+                        }
                     }
                 }
-                // Branch 3: Cancel token fired — drain and exit
                 _ = self.cancel_token.cancelled() => {
+                    app.state = AppState::Stopping;
                     self.state = AppState::Stopping;
                 }
             }
 
-            // Check for terminal stop condition
-            if self.state == AppState::Done {
+            if app.state == AppState::Done {
                 break;
             }
 
-            // Render placeholder — full layout in a later task
             self.terminal
-                .draw(|_frame| {})
+                .draw(|frame| ui::render(frame, &app))
                 .map_err(AppError::Io)?;
         }
 
@@ -171,43 +186,41 @@ impl Tui {
     pub fn state(&self) -> AppState {
         self.state
     }
+}
 
-    // ── Private handlers ────────────────────────────────────────
+// ── Event handler (free function) ─────────────────────────────────
 
-    fn handle_event(&mut self, event: AppEvent) {
-        match event {
-            AppEvent::Shutdown | AppEvent::LoopExhausted | AppEvent::Error(_) => {
-                self.state = AppState::Done;
+fn handle_app_event(app: &mut ui::App, event: AppEvent) {
+    match event {
+        AppEvent::WriterOutput(chunk) => {
+            if let Ok(mut buf) = app.writer_buffer.write() {
+                buf.push(&chunk);
             }
-            // All informational events pass through — the TUI render phase
-            // (Task 8) will display them in the appropriate panes.
-            AppEvent::WriterOutput(_)
-            | AppEvent::CriticOutput(_)
-            | AppEvent::ApologyReady(_)
-            | AppEvent::WriterDone(_)
-            | AppEvent::CritiqueReady(_)
-            | AppEvent::ApologyTriggered
-            | AppEvent::CostWarning(_, _) => {}
+            app.writer_version += 1;
         }
-    }
-
-    fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
-        // Only process press events — ignore release and repeat.
-        if key.kind != KeyEventKind::Press {
-            return;
+        AppEvent::CriticOutput(chunk) => {
+            if let Ok(mut buf) = app.critic_buffer.write() {
+                buf.push(&chunk);
+            }
+            app.critic_version += 1;
         }
-        match key.code {
-            // Esc or q → graceful stop with draining
-            KeyCode::Esc | KeyCode::Char('q') => {
-                self.cancel_token.cancel();
-                self.state = AppState::Stopping;
-            }
-            // Ctrl+C → immediate quit
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.state = AppState::Done;
-                self.cancel_token.cancel();
-            }
-            _ => {}
+        AppEvent::ApologyReady(text) => {
+            app.apology_text = Some(text);
+        }
+        AppEvent::WriterDone(_) | AppEvent::CritiqueReady(_) => {}
+        AppEvent::ApologyTriggered => {}
+        AppEvent::Error(err) => {
+            app.error = Some(err);
+        }
+        AppEvent::CostWarning(spent, limit) => {
+            app.cost_spent = spent;
+            app.cost_limit = limit;
+        }
+        AppEvent::LoopExhausted => {
+            app.state = AppState::Done;
+        }
+        AppEvent::Shutdown => {
+            app.state = AppState::Done;
         }
     }
 }
