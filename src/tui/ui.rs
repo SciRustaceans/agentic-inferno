@@ -113,6 +113,7 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     let focus_style = Style::default().fg(Color::Yellow);
     let default_style = Style::default();
+    let critic_unfocused_style = Style::default().fg(Color::Red);
 
     let writer_border = if app.focused_pane == FocusTarget::Writer {
         focus_style
@@ -122,7 +123,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     let critic_border = if app.focused_pane == FocusTarget::Critic {
         focus_style
     } else {
-        default_style
+        critic_unfocused_style
     };
 
     let writer_text = app
@@ -150,10 +151,15 @@ pub fn render(frame: &mut Frame, app: &App) {
         .read()
         .expect("critic_buffer RwLock poisoned")
         .content();
+    let critic_title = if app.critic_version > 0 {
+        format!("Critic [v{}]", app.critic_version)
+    } else {
+        "Critic".to_string()
+    };
     let critic_paragraph = Paragraph::new(critic_text)
         .block(
             Block::default()
-                .title("Critic")
+                .title(critic_title)
                 .borders(Borders::ALL)
                 .border_style(critic_border),
         )
@@ -190,17 +196,17 @@ pub fn render(frame: &mut Frame, app: &App) {
             );
         frame.render_widget(apology_paragraph, apology_area);
     } else {
-        let mut status = format!(
-            "Running... | Cost: ${:.2}/${:.2}",
-            app.cost_spent, app.cost_limit
+        let wv = app.writer_version;
+        let cv = app.critic_version;
+        let version_info = if wv > 0 || cv > 0 {
+            format!(" | Writer v{wv} | Critic v{cv}")
+        } else {
+            String::new()
+        };
+        let status = format!(
+            "Running... | Cost: ${:.2}/${:.2}{version_info} | Esc to stop",
+            app.cost_spent, app.cost_limit,
         );
-        if app.writer_version > 0 {
-            status.push_str(&format!(
-                " | Writer revision v{} complete",
-                app.writer_version
-            ));
-        }
-        status.push_str(" | Esc to stop");
         let status_paragraph = Paragraph::new(status)
             .block(Block::default().title("Penance").borders(Borders::ALL))
             .alignment(Alignment::Center);
