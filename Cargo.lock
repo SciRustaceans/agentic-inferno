@@ -12,6 +12,7 @@ dependencies = [
  "crossterm",
  "dotenvy",
  "futures",
+ "http",
  "ratatui",
  "reqwest",
  "serde",

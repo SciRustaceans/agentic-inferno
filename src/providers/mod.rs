@@ -1,3 +1,7 @@
+pub mod openai_compat;
+
+pub mod anthropic_cli;
+
 use crate::error::AppError;
 use std::fmt;
 
