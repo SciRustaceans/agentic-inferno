@@ -223,7 +223,7 @@ pub async fn run_spectacle(
 ///
 /// Returns `Some(secs)` while the cooldown is in effect, `None` once both
 /// the time and cycle conditions are satisfied (or no apology has occurred).
-fn cooldown_remaining_secs(cooldown: &ApologyCooldown) -> Option<u64> {
+pub fn cooldown_remaining_secs(cooldown: &ApologyCooldown) -> Option<u64> {
     let last_time = cooldown.last_apology_time?;
     let elapsed_secs = last_time.elapsed().as_secs();
 
@@ -724,7 +724,7 @@ fn resolve_base_url(provider: &Provider, config: &Config) -> Result<reqwest::Url
 /// Returns the byte index of the opening `[` if the marker is found as a
 /// complete token (`[APOLOGY]`, `[apology]`, `[Apology]`, etc.).  Partial
 /// markers like `[APOL` without the closing `]` are NOT matched.
-fn find_apology_marker(text: &str) -> Option<usize> {
+pub fn find_apology_marker(text: &str) -> Option<usize> {
     let marker_lower = "[apology]";
     let text_lower = text.to_ascii_lowercase();
     text_lower.find(marker_lower)
@@ -734,7 +734,7 @@ fn find_apology_marker(text: &str) -> Option<usize> {
 ///
 /// Harsh keywords: "incompetent", "worthless", "pathetic", "garbage",
 /// "useless", "hopeless", "embarrassing", "disgrace".
-fn count_harsh_keywords(text: &str) -> usize {
+pub fn count_harsh_keywords(text: &str) -> usize {
     const KEYWORDS: [&str; 8] = [
         "incompetent",
         "worthless",

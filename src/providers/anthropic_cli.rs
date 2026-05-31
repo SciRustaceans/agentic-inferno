@@ -26,19 +26,63 @@ use crate::providers::{ChatReply, ChatRequest, LlmClient};
 
 /// The JSON object emitted by `claude --output-format json`.
 #[derive(Debug, Deserialize)]
-struct ClaudeCliResponse {
+pub struct ClaudeCliResponse {
     /// Always `"result"` for message outputs.
     #[serde(rename = "type")]
-    response_type: String,
+    pub(crate) response_type: String,
     /// `"success"` on normal completion; other values indicate errors.
-    subtype: String,
+    pub(crate) subtype: String,
     /// Whether the CLI considered this an error response.
     #[serde(default)]
-    is_error: bool,
+    pub(crate) is_error: bool,
     /// The response text (present when `!is_error`).
-    result: Option<String>,
+    pub(crate) result: Option<String>,
     /// Estimated cost in USD (optional; may be absent on error responses).
-    total_cost_usd: Option<f64>,
+    pub(crate) total_cost_usd: Option<f64>,
+}
+
+/// Validate a parsed `ClaudeCliResponse` and extract a `ChatReply`.
+///
+/// Rejects responses where:
+/// - `response_type` is not `"result"`
+/// - `is_error` is `true`
+/// - `subtype` is not `"success"`
+/// - `result` text is missing
+///
+/// The `error_context` string (typically stderr output) is included in
+/// error messages for diagnostics.
+pub fn validate_claude_response(
+    response: ClaudeCliResponse,
+    error_context: &str,
+) -> Result<ChatReply, AppError> {
+    if response.response_type != "result" {
+        return Err(AppError::ClaudeCli {
+            subtype: "unexpected_type".into(),
+            message: format!(
+                "Expected response type 'result', got '{}'. stderr: {error_context}",
+                response.response_type,
+            ),
+        });
+    }
+
+    if response.is_error || response.subtype != "success" {
+        return Err(AppError::ClaudeCli {
+            subtype: response.subtype,
+            message: response.result.unwrap_or_else(|| {
+                format!("claude CLI returned an error with no message. stderr: {error_context}")
+            }),
+        });
+    }
+
+    let text = response.result.ok_or_else(|| AppError::ClaudeCli {
+        subtype: "empty".into(),
+        message: "claude CLI returned success with no result text".into(),
+    })?;
+
+    Ok(ChatReply {
+        text,
+        cost_usd: response.total_cost_usd,
+    })
 }
 
 impl LlmClient {
@@ -213,36 +257,7 @@ async fn anthropic_complete(
 
     // ── Validate response envelope ──────────────────────────────────
 
-    if response.response_type != "result" {
-        return Err(AppError::ClaudeCli {
-            subtype: "unexpected_type".into(),
-            message: format!(
-                "Expected response type 'result', got '{}'. stderr: {stderr_str}",
-                response.response_type,
-            ),
-        });
-    }
-
-    if response.is_error || response.subtype != "success" {
-        return Err(AppError::ClaudeCli {
-            subtype: response.subtype,
-            message: response.result.unwrap_or_else(|| {
-                format!(
-                    "claude CLI returned an error with no message. stderr: {stderr_str}"
-                )
-            }),
-        });
-    }
-
-    let text = response.result.ok_or_else(|| AppError::ClaudeCli {
-        subtype: "empty".into(),
-        message: "claude CLI returned success with no result text".into(),
-    })?;
-
-    Ok(ChatReply {
-        text,
-        cost_usd: response.total_cost_usd,
-    })
+    validate_claude_response(response, &stderr_str)
 }
 
 #[cfg(test)]
