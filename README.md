@@ -1,14 +1,6 @@
 # agentic-inferno
 
-A terminal app that runs two LLM agents at once: a Writer that keeps revising a
-document, and a Critic that heckles every revision. The Writer never tries to
-finish. It just keeps reworking the document while the Critic responds to each
-version. When the criticism gets harsh, the Writer stops and apologizes to you.
-
-You watch. The Writer and Critic each make their own API calls and you see both
-outputs in split panes. There's no convergence and no "done" state. The loop
-runs until you hit Esc or the cost ceiling is reached. Your original document is
-never touched.
+**Make the CLANKER APOLOGIZE**
 
 ## Screenshots
 Examples of TUI in use.
